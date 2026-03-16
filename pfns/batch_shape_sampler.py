@@ -52,7 +52,7 @@ class BatchShapeSamplerConfig(BaseConfig):
             - (
                 self.fixed_num_test_instances
                 if self.fixed_num_test_instances is not None
-                else 0
+                else 1  # EDIT: Fixes a bug that the test set can be empty
             ),
         )
 
