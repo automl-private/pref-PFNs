@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--methods", nargs="*", default=None)
     parser.add_argument("--dpi", type=int, default=200)
     parser.add_argument("--title-prefix", type=str, default="GP preference BO")
+    parser.add_argument("--eps", type=float, default=1e-12)
     return parser.parse_args()
 
 
@@ -44,6 +45,18 @@ def slugify(text: str) -> str:
 
 def mean_stderr(log10_regret: torch.Tensor) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     values = log10_regret.detach().cpu().float().reshape(-1, log10_regret.shape[-1])
+    counts = torch.isfinite(values).sum(dim=0)
+    mean = torch.nanmean(values, dim=0)
+    stderr = torch.zeros_like(mean)
+    for idx in range(values.shape[-1]):
+        finite = values[:, idx][torch.isfinite(values[:, idx])]
+        if finite.numel() > 1:
+            stderr[idx] = finite.std(unbiased=True) / math.sqrt(finite.numel())
+    return mean.numpy(), stderr.numpy(), counts.numpy()
+
+
+def average_regret_stderr(simple_regret: torch.Tensor) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    values = simple_regret.detach().cpu().float().reshape(-1, simple_regret.shape[-1])
     counts = torch.isfinite(values).sum(dim=0)
     mean = torch.nanmean(values, dim=0)
     stderr = torch.zeros_like(mean)
@@ -200,6 +213,7 @@ def write_summary(
     *,
     summary_out: Path,
     methods: Optional[Sequence[str]],
+    eps: float,
 ) -> None:
     summary_out.parent.mkdir(parents=True, exist_ok=True)
     with summary_out.open("w", newline="") as f:
@@ -226,6 +240,9 @@ def write_summary(
                 "step",
                 "mean_log10_regret",
                 "stderr_log10_regret",
+                "average_regret",
+                "log10_average_regret",
+                "stderr_regret",
                 "n",
             ]
         )
@@ -238,11 +255,16 @@ def write_summary(
                 metadata = payload.get("metadata", {})
                 train_h = metadata.get("train_hparams") or {}
                 y, err, counts = mean_stderr(payload["log10_regret"])
-                for step, mean, stderr, count in zip(
+                average_regret, regret_err, regret_counts = average_regret_stderr(payload["simple_regret"])
+                log10_average_regret = np.log10(np.maximum(average_regret, eps))
+                for step, mean, stderr, avg_regret, log10_avg_regret, avg_regret_stderr, count in zip(
                     range(1, len(y) + 1),
                     y,
                     err,
-                    counts,
+                    average_regret,
+                    log10_average_regret,
+                    regret_err,
+                    np.minimum(counts, regret_counts),
                 ):
                     writer.writerow(
                         [
@@ -266,6 +288,9 @@ def write_summary(
                             step,
                             float(mean),
                             float(stderr),
+                            float(avg_regret),
+                            float(log10_avg_regret),
+                            float(avg_regret_stderr),
                             int(count),
                         ]
                     )
@@ -300,7 +325,7 @@ def main() -> None:
     if len(results["suites"]) > 1:
         print(f"[plot] saved {all_path}")
 
-    write_summary(results, summary_out=args.summary_out, methods=methods)
+    write_summary(results, summary_out=args.summary_out, methods=methods, eps=args.eps)
     print(f"[summary] saved {args.summary_out}")
 
 

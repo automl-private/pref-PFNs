@@ -46,6 +46,7 @@ from evaluation.agents import (
 )
 from evaluation.agents.base import Comparison, PBOAgent
 from evaluation.benchmarks_1d import BENCHMARKS_1D, make_benchmark_1d
+from evaluation.grid_designs import make_1d_grid
 from evaluation.loop import run_bo_loop
 from pfns.run_training_cli import load_config_from_python
 
@@ -147,10 +148,12 @@ def sample_gp_function(
     n_grid: int,
     hparams: GPHyperparameters,
     seed: int,
+    grid_design: str = "uniform",
+    grid_seed: int = 0,
     jitter: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Sample a noiseless latent 1D GP path on a fixed grid."""
-    x = torch.linspace(0.0, 1.0, n_grid, dtype=torch.double)
+    x = make_1d_grid(n_grid, design=grid_design, seed=grid_seed, dtype=torch.double)
 
     base_kernel = gpytorch.kernels.RBFKernel()
     base_kernel.lengthscale = hparams.lengthscale
@@ -414,6 +417,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-gp-functions", type=int, default=5)
     parser.add_argument("--n-bo-seeds", type=int, default=10)
     parser.add_argument("--n-grid", type=int, default=500)
+    parser.add_argument("--grid-design", choices=("uniform", "lhs"), default="uniform")
+    parser.add_argument("--grid-seed-offset", type=int, default=20_000)
     parser.add_argument("--eps", type=float, default=1e-12)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--pfn-ts-samples", type=int, default=2)
@@ -610,6 +615,8 @@ def build_eval_suite_specs(
                     n_grid=args.n_grid,
                     hparams=hparams,
                     seed=args.gp_seed_offset + gp_idx,
+                    grid_design=args.grid_design,
+                    grid_seed=args.grid_seed_offset + gp_idx,
                 )
                 for gp_idx in range(args.n_gp_functions)
             )
@@ -638,6 +645,8 @@ def build_eval_suite_specs(
                     n_grid=args.n_grid,
                     normalization=normalization,
                     device="cpu",
+                    grid_design=args.grid_design,
+                    grid_seed=args.grid_seed_offset,
                 )
                 suite_name = f"{benchmark_name}_{normalization}"
                 suites.append(
@@ -653,6 +662,8 @@ def build_eval_suite_specs(
                             "normalization": normalization,
                             "noise_std": float(args.deterministic_noise_std),
                             "reference_hparams": reference_hparams.as_dict(),
+                            "grid_design": args.grid_design,
+                            "grid_seed": int(args.grid_seed_offset),
                         },
                     )
                 )
@@ -788,6 +799,8 @@ def main() -> None:
             "n_init": args.n_init,
             "n_gp_functions": args.n_gp_functions,
             "n_bo_seeds": args.n_bo_seeds,
+            "grid_design": args.grid_design,
+            "grid_seed_offset": args.grid_seed_offset,
             "eps": args.eps,
             "device": args.device,
             "selected_methods": selected_methods,

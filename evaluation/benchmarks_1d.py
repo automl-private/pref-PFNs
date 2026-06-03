@@ -8,35 +8,61 @@ from typing import Callable, Mapping
 
 import torch
 
+from evaluation.grid_designs import GridDesign, make_1d_grid
 
-BenchmarkFn = Callable[[int, str], tuple[torch.Tensor, torch.Tensor]]
+
+BenchmarkFn = Callable[[int, str, GridDesign, int], tuple[torch.Tensor, torch.Tensor]]
 
 
-def _unit_grid(n_grid: int, device: str = "cpu") -> torch.Tensor:
-    if n_grid < 2:
-        raise ValueError("n_grid must be at least 2 for deterministic benchmarks.")
-    return torch.linspace(0.0, 1.0, n_grid, device=device, dtype=torch.float32)
+def _unit_grid(
+    n_grid: int,
+    device: str = "cpu",
+    grid_design: GridDesign = "uniform",
+    grid_seed: int = 0,
+) -> torch.Tensor:
+    return make_1d_grid(
+        n_grid,
+        design=grid_design,
+        seed=grid_seed,
+        device=device,
+        dtype=torch.float32,
+    )
 
 
 def _to_domain(x_unit: torch.Tensor, lower: float, upper: float) -> torch.Tensor:
     return lower + x_unit * (upper - lower)
 
 
-def forrester_1d(n_grid: int, device: str = "cpu") -> tuple[torch.Tensor, torch.Tensor]:
-    x = _unit_grid(n_grid, device=device)
+def forrester_1d(
+    n_grid: int,
+    device: str = "cpu",
+    grid_design: GridDesign = "uniform",
+    grid_seed: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x = _unit_grid(n_grid, device=device, grid_design=grid_design, grid_seed=grid_seed)
     f = (6.0 * x - 2.0).square() * torch.sin(12.0 * x - 4.0)
     return x, f
 
 
-def gramacy_lee_1d(n_grid: int, device: str = "cpu") -> tuple[torch.Tensor, torch.Tensor]:
-    x = _unit_grid(n_grid, device=device)
+def gramacy_lee_1d(
+    n_grid: int,
+    device: str = "cpu",
+    grid_design: GridDesign = "uniform",
+    grid_seed: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x = _unit_grid(n_grid, device=device, grid_design=grid_design, grid_seed=grid_seed)
     z = _to_domain(x, 0.5, 2.5)
     f = torch.sin(10.0 * math.pi * z) / (2.0 * z) + (z - 1.0).pow(4)
     return x, f
 
 
-def higdon_1d(n_grid: int, device: str = "cpu") -> tuple[torch.Tensor, torch.Tensor]:
-    x = _unit_grid(n_grid, device=device)
+def higdon_1d(
+    n_grid: int,
+    device: str = "cpu",
+    grid_design: GridDesign = "uniform",
+    grid_seed: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x = _unit_grid(n_grid, device=device, grid_design=grid_design, grid_seed=grid_seed)
     z = _to_domain(x, 0.0, 20.0)
     left = torch.sin(math.pi * z / 5.0)
     right = 0.2 * torch.cos(4.0 * math.pi * z / 5.0)
@@ -44,37 +70,62 @@ def higdon_1d(n_grid: int, device: str = "cpu") -> tuple[torch.Tensor, torch.Ten
     return x, f
 
 
-def ackley_1d(n_grid: int, device: str = "cpu") -> tuple[torch.Tensor, torch.Tensor]:
-    x = _unit_grid(n_grid, device=device)
+def ackley_1d(
+    n_grid: int,
+    device: str = "cpu",
+    grid_design: GridDesign = "uniform",
+    grid_seed: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x = _unit_grid(n_grid, device=device, grid_design=grid_design, grid_seed=grid_seed)
     z = _to_domain(x, -32.768, 32.768)
     objective = -20.0 * torch.exp(-0.2 * z.abs()) - torch.exp(torch.cos(2.0 * math.pi * z))
     objective = objective + 20.0 + math.e
     return x, -objective
 
 
-def rastrigin_1d(n_grid: int, device: str = "cpu") -> tuple[torch.Tensor, torch.Tensor]:
-    x = _unit_grid(n_grid, device=device)
+def rastrigin_1d(
+    n_grid: int,
+    device: str = "cpu",
+    grid_design: GridDesign = "uniform",
+    grid_seed: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x = _unit_grid(n_grid, device=device, grid_design=grid_design, grid_seed=grid_seed)
     z = _to_domain(x, -5.12, 5.12)
     objective = 10.0 + z.square() - 10.0 * torch.cos(2.0 * math.pi * z)
     return x, -objective
 
 
-def griewank_1d(n_grid: int, device: str = "cpu") -> tuple[torch.Tensor, torch.Tensor]:
-    x = _unit_grid(n_grid, device=device)
+def griewank_1d(
+    n_grid: int,
+    device: str = "cpu",
+    grid_design: GridDesign = "uniform",
+    grid_seed: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x = _unit_grid(n_grid, device=device, grid_design=grid_design, grid_seed=grid_seed)
     z = _to_domain(x, -600.0, 600.0)
     objective = 1.0 + z.square() / 4000.0 - torch.cos(z)
     return x, -objective
 
 
-def schwefel_1d(n_grid: int, device: str = "cpu") -> tuple[torch.Tensor, torch.Tensor]:
-    x = _unit_grid(n_grid, device=device)
+def schwefel_1d(
+    n_grid: int,
+    device: str = "cpu",
+    grid_design: GridDesign = "uniform",
+    grid_seed: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x = _unit_grid(n_grid, device=device, grid_design=grid_design, grid_seed=grid_seed)
     z = _to_domain(x, -500.0, 500.0)
     objective = 418.9829 - z * torch.sin(torch.sqrt(z.abs()))
     return x, -objective
 
 
-def weierstrass_1d(n_grid: int, device: str = "cpu") -> tuple[torch.Tensor, torch.Tensor]:
-    x = _unit_grid(n_grid, device=device)
+def weierstrass_1d(
+    n_grid: int,
+    device: str = "cpu",
+    grid_design: GridDesign = "uniform",
+    grid_seed: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x = _unit_grid(n_grid, device=device, grid_design=grid_design, grid_seed=grid_seed)
     z = _to_domain(x, -0.5, 0.5)
     a = 0.5
     b = 3.0
@@ -87,8 +138,13 @@ def weierstrass_1d(n_grid: int, device: str = "cpu") -> tuple[torch.Tensor, torc
     return x, -objective
 
 
-def branin_slice_1d(n_grid: int, device: str = "cpu") -> tuple[torch.Tensor, torch.Tensor]:
-    x = _unit_grid(n_grid, device=device)
+def branin_slice_1d(
+    n_grid: int,
+    device: str = "cpu",
+    grid_design: GridDesign = "uniform",
+    grid_seed: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x = _unit_grid(n_grid, device=device, grid_design=grid_design, grid_seed=grid_seed)
     x1 = _to_domain(x, -5.0, 10.0)
     x2 = torch.full_like(x1, 7.5)
     a = 1.0
@@ -102,8 +158,13 @@ def branin_slice_1d(n_grid: int, device: str = "cpu") -> tuple[torch.Tensor, tor
     return x, -objective
 
 
-def sinusoidal_1d(n_grid: int, device: str = "cpu") -> tuple[torch.Tensor, torch.Tensor]:
-    x = _unit_grid(n_grid, device=device)
+def sinusoidal_1d(
+    n_grid: int,
+    device: str = "cpu",
+    grid_design: GridDesign = "uniform",
+    grid_seed: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x = _unit_grid(n_grid, device=device, grid_design=grid_design, grid_seed=grid_seed)
     f = torch.sin(6.0 * math.pi * x) + 0.5 * torch.sin(2.0 * math.pi * x) + 0.1 * x
     return x, f
 
@@ -140,11 +201,13 @@ def make_benchmark_1d(
     n_grid: int,
     normalization: str,
     device: str = "cpu",
+    grid_design: GridDesign = "uniform",
+    grid_seed: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     try:
         fn = BENCHMARKS_1D[name]
     except KeyError as err:
         available = ", ".join(BENCHMARKS_1D)
         raise ValueError(f"Unknown deterministic benchmark {name!r}. Available: {available}") from err
-    x_grid, f_grid = fn(n_grid, device)
+    x_grid, f_grid = fn(n_grid, device, grid_design, grid_seed)
     return x_grid.float(), normalize_f_grid(f_grid, normalization)
