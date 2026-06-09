@@ -14,7 +14,13 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from .base import Comparison, PBOAgent
+from .base import (
+    Comparison,
+    PBOAgent,
+    candidate_matrix,
+    candidate_value,
+    nearest_candidate_index,
+)
 
 try:
     from botorch.acquisition.preference import qExpectedUtilityOfBestOption
@@ -35,14 +41,14 @@ def _require_botorch():
         )
 
 
-def _rbf_kernel_1d(
+def _rbf_kernel(
     x: Tensor,
     *,
     lengthscale: float,
     outputscale: float,
 ) -> Tensor:
-    x = x.reshape(-1, 1)
-    d2 = (x - x.T).square()
+    x = candidate_matrix(x)
+    d2 = torch.cdist(x, x).square()
     return outputscale * torch.exp(-0.5 * d2 / (lengthscale**2))
 
 
@@ -99,8 +105,8 @@ class FixedHyperparamQEUBOAgent(PBOAgent):
     ) -> Tensor:
         rows = []
         for winner, loser in comparisons:
-            winner_idx = (candidate_pool - winner).abs().argmin().item()
-            loser_idx = (candidate_pool - loser).abs().argmin().item()
+            winner_idx = nearest_candidate_index(candidate_pool, winner)
+            loser_idx = nearest_candidate_index(candidate_pool, loser)
             rows.append([winner_idx, loser_idx])
         return torch.tensor(rows, dtype=torch.long)
 
@@ -109,10 +115,10 @@ class FixedHyperparamQEUBOAgent(PBOAgent):
         comparisons: list[Comparison],
         candidate_pool: Tensor,
     ) -> "PairwiseGP":
-        train_X = candidate_pool.to(dtype=self.dtype).unsqueeze(-1)
+        train_X = candidate_matrix(candidate_pool, dtype=self.dtype)
         train_comp = self._pool_indices(comparisons, candidate_pool)
 
-        base_kernel = RBFKernel()
+        base_kernel = RBFKernel(ard_num_dims=train_X.shape[-1])
         base_kernel.lengthscale = self.lengthscale
 
         covar_module = ScaleKernel(base_kernel)
@@ -132,22 +138,25 @@ class FixedHyperparamQEUBOAgent(PBOAgent):
         return model
 
     def _known_prior_qeubo(self, candidate_pool: Tensor) -> Tensor:
-        x = candidate_pool.to(dtype=self.dtype)
-        K = _rbf_kernel_1d(
+        x = candidate_matrix(candidate_pool, dtype=self.dtype)
+        K = _rbf_kernel(
             x,
             lengthscale=self.lengthscale,
             outputscale=self.outputscale,
         )
-        K = K + self.jitter * torch.eye(x.numel(), dtype=self.dtype, device=x.device)
+        M = x.shape[0]
+        K = K + self.jitter * torch.eye(M, dtype=self.dtype, device=x.device)
         L = torch.linalg.cholesky(K)
-        z = torch.randn(self.num_acqf_samples, x.numel(), dtype=self.dtype, device=x.device)
+        z = torch.randn(self.num_acqf_samples, M, dtype=self.dtype, device=x.device)
         F = self.mean_constant + z @ L.T
         return _compute_qeubo_from_samples(F).float()
 
     def _posterior_qeubo(self, model: "PairwiseGP", candidate_pool: Tensor) -> Tensor:
-        x = candidate_pool.to(dtype=self.dtype)
-        x1, x2 = torch.meshgrid(x, x, indexing="ij")
-        pair_grid = torch.stack([x1.reshape(-1), x2.reshape(-1)], dim=-1).unsqueeze(-1)
+        x = candidate_matrix(candidate_pool, dtype=self.dtype)
+        M = x.shape[0]
+        x1 = x.repeat_interleave(M, dim=0)
+        x2 = x.repeat(M, 1)
+        pair_grid = torch.stack([x1, x2], dim=1)
 
         sampler = SobolQMCNormalSampler(sample_shape=torch.Size([self.num_acqf_samples]))
         acqf = qExpectedUtilityOfBestOption(pref_model=model, sampler=sampler)
@@ -157,7 +166,7 @@ class FixedHyperparamQEUBOAgent(PBOAgent):
         with torch.no_grad():
             for start in range(0, pair_grid.shape[0], batch_size):
                 values.append(acqf(pair_grid[start : start + batch_size]).cpu())
-        return torch.cat(values).reshape(x.numel(), x.numel()).float()
+        return torch.cat(values).reshape(M, M).float()
 
     def _qeubo_matrix(
         self,
@@ -175,9 +184,9 @@ class FixedHyperparamQEUBOAgent(PBOAgent):
         candidate_pool: Tensor,
     ) -> Tensor:
         if not comparisons:
-            return torch.full_like(candidate_pool, self.mean_constant, dtype=torch.float32)
+            return torch.full((candidate_pool.shape[0],), self.mean_constant, dtype=torch.float32)
         model = self._fit_model(comparisons, candidate_pool)
-        X = candidate_pool.to(dtype=self.dtype).unsqueeze(-1)
+        X = candidate_matrix(candidate_pool, dtype=self.dtype)
         with torch.no_grad():
             posterior = model.posterior(X)
         return posterior.mean.squeeze(-1).squeeze(-1).detach().cpu().float()
@@ -186,19 +195,19 @@ class FixedHyperparamQEUBOAgent(PBOAgent):
         self,
         comparisons: list[Comparison],
         candidate_pool: Tensor,
-    ) -> tuple[float, float]:
+    ) -> tuple:
         qeubo = self._qeubo_matrix(comparisons, candidate_pool)
         idx = torch.arange(qeubo.shape[0])
         qeubo[idx, idx] = -torch.inf
         flat_idx = torch.argmax(qeubo)
         i = int(flat_idx // qeubo.shape[1])
         j = int(flat_idx % qeubo.shape[1])
-        return candidate_pool[i].item(), candidate_pool[j].item()
+        return candidate_value(candidate_pool[i]), candidate_value(candidate_pool[j])
 
     def recommend(
         self,
         comparisons: list[Comparison],
         candidate_pool: Tensor,
-    ) -> float:
+    ):
         mean = self._posterior_mean(comparisons, candidate_pool)
-        return candidate_pool[mean.argmax()].item()
+        return candidate_value(candidate_pool[mean.argmax()])

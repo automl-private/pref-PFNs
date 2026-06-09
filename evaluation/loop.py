@@ -13,6 +13,25 @@ from .agents.base import PBOAgent, Comparison
 from .oracle import Oracle
 
 
+def _candidate_value(candidate):
+    """Convert a grid tensor row to a scalar float or multidim point tuple."""
+    candidate = torch.as_tensor(candidate)
+    if candidate.ndim == 0 or candidate.numel() == 1:
+        # Превращает scalar tensor в обычный Python float
+        return float(candidate.reshape(-1)[0].item())
+    # плоский вектор
+    return tuple(float(v) for v in candidate.reshape(-1).tolist())
+
+def _point_str(point) -> str:
+    """Format scalar or multidim points for verbose BO-loop logging."""
+    if isinstance(point, (tuple, list)):
+        return "(" + ", ".join(f"{float(v):.3f}" for v in point) + ")"
+    tensor = torch.as_tensor(point)
+    if tensor.ndim > 0 and tensor.numel() > 1:
+        return "(" + ", ".join(f"{float(v):.3f}" for v in tensor.reshape(-1).tolist()) + ")"
+    return f"{float(tensor.reshape(-1)[0].item()):.3f}"
+
+
 def run_bo_loop(
     agent: PBOAgent,
     oracle: Oracle,
@@ -53,13 +72,15 @@ def run_bo_loop(
     for t in range(budget):
         # --- suggest pair ---
         if t < n_init:
-            pool = candidate_pool.tolist()
-            x1, x2 = rng.sample(pool, 2)
+            idx1, idx2 = rng.sample(range(len(candidate_pool)), 2)
+            x1 = _candidate_value(candidate_pool[idx1])
+            x2 = _candidate_value(candidate_pool[idx2])
             phase = "init"
         else:
             x1, x2 = agent.suggest_pair(comparisons, candidate_pool)
             phase = "bo"
 
+        # ищет ближайшие точки к x1, x2 на сетке и сравнивает
         winner, loser = oracle.compare(x1, x2)
         comparisons.append((winner, loser))
 
@@ -73,8 +94,9 @@ def run_bo_loop(
         if verbose:
             print(
                 f"    t={t+1:3d}/{budget} [{phase:4s}]"
-                f"  pair=({x1:.3f}, {x2:.3f})  winner={winner:.3f}"
-                f"  x_hat={x_hat:.3f}  SR={sr:.4f}"
+                f"  pair=({_point_str(x1)}, {_point_str(x2)})"
+                f"  winner={_point_str(winner)}"
+                f"  x_hat={_point_str(x_hat)}  SR={sr:.4f}"
             )
 
     return {

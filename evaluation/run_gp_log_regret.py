@@ -24,7 +24,7 @@ import random
 import re
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, is_dataclass, replace
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -47,11 +47,12 @@ from evaluation.agents import (
 from evaluation.agents.base import Comparison, PBOAgent
 from evaluation.benchmarks_1d import BENCHMARKS_1D, make_benchmark_1d
 from evaluation.grid_designs import make_1d_grid
-from evaluation.loop import run_bo_loop
+from evaluation.loop import run_bo_loop, _candidate_value
 from pfns.run_training_cli import load_config_from_python
 
 
 DEFAULT_SKIP_CHECKPOINTS = ("pfn_vanilla_gp_1d_10M.pt",)
+MULTIDIM_CHECKPOINT_RE = re.compile(r"^pref_gp_(\d+)d_(.+)$")
 BASELINE_METHODS = ("random", "gp_pbo", "qeubo", "fixed_qeubo")
 
 
@@ -86,6 +87,8 @@ class CheckpointSpec:
     kind: str
     train_hparams: GPHyperparameters
     prior_class: str
+    input_dim: int = 1
+    config_template_name: Optional[str] = None
 
     @property
     def is_ranking_baseline(self) -> bool:
@@ -101,9 +104,8 @@ class EvalSuiteSpec:
     eval_hparams: Optional[GPHyperparameters]
     benchmark: Optional[Dict]
 
-
 class GaussianPreferenceOracle:
-    """1D fixed-grid oracle with Gaussian comparison noise."""
+    """Fixed-grid oracle with Gaussian comparison noise."""
 
     def __init__(
         self,
@@ -119,49 +121,98 @@ class GaussianPreferenceOracle:
         self._rng = torch.Generator(device="cpu")
         self._rng.manual_seed(self.seed)
 
+        if self.x_grid.ndim == 1:
+            assert self.x_grid.shape[0] == self.f_grid.shape[0]
+        else:
+            assert self.x_grid.shape[0] == self.f_grid.shape[0]
+
     @property
     def f_opt(self) -> float:
         return self.f_grid.max().item()
 
     @property
-    def x_opt(self) -> float:
-        return self.x_grid[self.f_grid.argmax()].item()
+    def x_opt(self):
+        # returns tuple of coordinates for the optimal point (x1, x2, ..., xd)
+        return self._format_point(self.x_grid[self.f_grid.argmax()])
 
-    def f_at(self, x: float) -> float:
-        idx = (self.x_grid - float(x)).abs().argmin()
+    def _point_tensor(self, x) -> torch.Tensor:
+        x = torch.as_tensor(x, dtype=self.x_grid.dtype)
+        # Если oracle 1D, то x_grid.shape == (M,), и точка должна быть scalar tensor
+        if self.x_grid.ndim == 1:
+            return x.reshape(())
+        # А если multidim, то точка приводится к вектору
+        return x.reshape(-1)
+
+    def _nearest_idx(self, x) -> int:
+        x = self._point_tensor(x)
+        if self.x_grid.ndim == 1:
+            return int((self.x_grid - float(x)).abs().argmin().item())
+
+        distances = torch.linalg.norm(self.x_grid - x, dim=-1)
+        return int(distances.argmin().item())
+
+    def _format_point(self, x: torch.Tensor):
+        if self.x_grid.ndim == 1:
+            return float(x.item())
+        return tuple(x.detach().cpu().tolist())
+
+    def f_at(self, x) -> float:
+        idx = self._nearest_idx(x)
         return self.f_grid[idx].item()
 
-    def compare(self, x1: float, x2: float) -> tuple[float, float]:
+    def compare(self, x1, x2):
         f1 = self.f_at(x1)
         f2 = self.f_at(x2)
+
         if self.noise_std > 0:
             f1 = f1 + self.noise_std * torch.randn((), generator=self._rng).item()
             f2 = f2 + self.noise_std * torch.randn((), generator=self._rng).item()
-        return (x1, x2) if f1 >= f2 else (x2, x1)
 
-    def simple_regret(self, x_recommended: float) -> float:
+        if f1 >= f2:
+            return self._format_point(self._point_tensor(x1)), self._format_point(self._point_tensor(x2))
+        return self._format_point(self._point_tensor(x2)), self._format_point(self._point_tensor(x1))
+
+    def simple_regret(self, x_recommended) -> float:
         return max(self.f_opt - self.f_at(x_recommended), 0.0)
 
 
 def sample_gp_function(
     *,
     n_grid: int,
+    input_dim: int = 1,
     hparams: GPHyperparameters,
     seed: int,
     grid_design: str = "uniform",
     grid_seed: int = 0,
     jitter: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sample a noiseless latent 1D GP path on a fixed grid."""
-    x = make_1d_grid(n_grid, design=grid_design, seed=grid_seed, dtype=torch.double)
+    """Sample a noiseless latent GP path on a fixed candidate set."""
+    if input_dim < 1:
+        raise ValueError(f"input_dim must be positive, got {input_dim}")
+    if input_dim == 1:
+        x_eval = make_1d_grid(n_grid, design=grid_design, seed=grid_seed, dtype=torch.double)
+        x_kernel = x_eval.unsqueeze(-1)
+    else:
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(int(grid_seed))
+        if grid_design == "lhs":
+            base = torch.arange(n_grid, dtype=torch.double).unsqueeze(-1)
+            offsets = torch.rand(n_grid, input_dim, generator=generator, dtype=torch.double)
+            x_kernel = (base + offsets) / float(n_grid)
+            for dim in range(input_dim):
+                perm = torch.randperm(n_grid, generator=generator)
+                x_kernel[:, dim] = x_kernel[perm, dim]
+        else:
+            x_kernel = torch.rand(n_grid, input_dim, generator=generator, dtype=torch.double)
+        x_eval = x_kernel
 
-    base_kernel = gpytorch.kernels.RBFKernel()
+    base_kernel = gpytorch.kernels.RBFKernel(ard_num_dims=input_dim)
     base_kernel.lengthscale = hparams.lengthscale
     covar_module = gpytorch.kernels.ScaleKernel(base_kernel)
     covar_module.outputscale = hparams.outputscale
 
     mean = torch.zeros(n_grid, dtype=torch.double)
-    covar = covar_module(x.unsqueeze(-1)).add_jitter(jitter)
+    covar = covar_module(x_kernel).add_jitter(jitter)
     cov = covar.to_dense() if hasattr(covar, "to_dense") else covar.evaluate()
     dist = torch.distributions.MultivariateNormal(mean, cov)
 
@@ -173,7 +224,7 @@ def sample_gp_function(
     finally:
         torch.random.set_rng_state(old_state)
 
-    return x.float(), f.float()
+    return x_eval.float(), f.float()
 
 
 def _build_pref_context(
@@ -181,13 +232,16 @@ def _build_pref_context(
     *,
     dtype: torch.dtype,
     device: torch.device,
+    input_dims: int = 2,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if not comparisons:
-        x_ctx = torch.zeros(1, 0, 2, dtype=dtype, device=device)
+        x_ctx = torch.zeros(1, 0, input_dims, dtype=dtype, device=device)
         y_ctx = torch.zeros(1, 0, dtype=dtype, device=device)
         return x_ctx, y_ctx
 
-    pairs = torch.tensor(comparisons, dtype=dtype, device=device)
+    pairs = torch.as_tensor(comparisons, dtype=dtype, device=device)
+    if pairs.ndim == 3:
+        pairs = pairs.reshape(pairs.shape[0], -1)
     x_ctx = pairs.unsqueeze(0)
     y_ctx = torch.zeros(1, len(comparisons), dtype=dtype, device=device)
     return x_ctx, y_ctx
@@ -206,7 +260,7 @@ def _safe_random_challenger(
             return challenger
     return pool[0] if pool[0] != chosen else pool[-1]
 
-
+# TODO: make fixes for multidim
 class UtilityPFNAgent(PBOAgent):
     """PFN agent for utility or negative-regret scalar predictions."""
 
@@ -242,7 +296,7 @@ class UtilityPFNAgent(PBOAgent):
         test_x[0, :, 0] = x_query
         with torch.no_grad():
             logits = self.model(x_ctx, y_ctx, test_x=test_x)
-        return logits[0]
+        return logits[0] # (M, num_bins)
 
     def _score(self, comparisons: list[Comparison], candidate_pool: torch.Tensor) -> torch.Tensor:
         logits = self._logits(comparisons, candidate_pool)
@@ -253,8 +307,8 @@ class UtilityPFNAgent(PBOAgent):
         comparisons: list[Comparison],
         candidate_pool: torch.Tensor,
     ) -> torch.Tensor:
-        logits = self._logits(comparisons, candidate_pool)
-        return self.criterion.sample(logits).detach().cpu()
+        logits = self._logits(comparisons, candidate_pool) # (M, B)
+        return self.criterion.sample(logits).detach().cpu() # (M,) один sampled scalar score на каждую candidate point
 
     def suggest_pair(
         self,
@@ -266,9 +320,14 @@ class UtilityPFNAgent(PBOAgent):
             return candidate_pool[idx[0]].item(), candidate_pool[idx[1]].item()
 
         argmaxes: List[float] = []
-        for _ in range(max(1, self.n_ts_samples)):
+        for _ in range(max(1, self.n_ts_samples)): # n_ts_samples = 2
+            # 1. sample one possible score function over grid
+            # 2. take its argmax
+            # 3. sample another possible score function over grid
+            # 4. take its argmax
+            # 5. use these two argmaxes as comparison pair
             scores = self._sample_score(comparisons, candidate_pool)
-            argmaxes.append(candidate_pool[scores.argmax()].item())
+            argmaxes.append(candidate_pool[scores.argmax()].item()) # [a, b]
 
         if len(set(argmaxes)) == 1:
             return argmaxes[0], _safe_random_challenger(candidate_pool, argmaxes[0])
@@ -294,12 +353,14 @@ class PairScorePFNAgent(PBOAgent):
         *,
         device: str,
         pair_batch_size: int,
+        input_dim: int,
     ) -> None:
         self.model = model
         self.model.eval()
         self.device = torch.device(device)
         self.criterion = model.criterion
         self.pair_batch_size = int(pair_batch_size)
+        self.input_dim = int(input_dim)
 
     @property
     def dtype(self) -> torch.dtype:
@@ -310,14 +371,27 @@ class PairScorePFNAgent(PBOAgent):
         comparisons: list[Comparison],
         candidate_pool: torch.Tensor,
     ) -> torch.Tensor:
+        x = candidate_pool.to(dtype=self.dtype, device=self.device)
+        if x.ndim == 1:
+            M = x.numel()
+            x1, x2 = torch.meshgrid(x, x, indexing="ij")
+            pairs = torch.stack([x1.reshape(-1), x2.reshape(-1)], dim=-1)
+        else:
+            M = x.shape[0]
+            x1 = x.repeat_interleave(M, dim=0)
+            x2 = x.repeat(M, 1)
+            pairs = torch.cat([x1, x2], dim=-1)
+
         x_ctx, y_ctx = _build_pref_context(
             comparisons,
             dtype=self.dtype,
             device=self.device,
+            input_dims=self.input_dim*2
         )
-        x = candidate_pool.to(dtype=self.dtype, device=self.device)
-        x1, x2 = torch.meshgrid(x, x, indexing="ij")
-        pairs = torch.stack([x1.reshape(-1), x2.reshape(-1)], dim=-1)
+        # 1D x (4,)      x1 (4, 4)   x2 (4, 4)   pairs (16, 2)
+        # 2D x (4, 2)   x1 (16, 2)  x2 (16, 2)  pairs (16, 4)
+
+        # Определяет, сколько пар отправлять в PFN за один forward pass.
         batch_size = pairs.shape[0] if self.pair_batch_size <= 0 else self.pair_batch_size
 
         chunks: List[torch.Tensor] = []
@@ -327,7 +401,6 @@ class PairScorePFNAgent(PBOAgent):
                 logits = self.model(x_ctx, y_ctx, test_x=test_x)
                 chunks.append(self.criterion.mean(logits)[0].detach().cpu())
 
-        M = candidate_pool.numel()
         return torch.cat(chunks).reshape(M, M)
 
     def suggest_pair(
@@ -337,15 +410,20 @@ class PairScorePFNAgent(PBOAgent):
     ) -> tuple[float, float]:
         if not comparisons:
             idx = torch.randperm(len(candidate_pool))[:2]
-            return candidate_pool[idx[0]].item(), candidate_pool[idx[1]].item()
+            return _candidate_value(candidate_pool[idx[0]]), _candidate_value(candidate_pool[idx[1]])
 
         scores = self._pair_scores(comparisons, candidate_pool)
+        # scores[i, j] ≈ E[max(f(x_i), f(x_j)) | comparisons]
+        # scores[i, j] ≈ E[max(f(x_i), f(x_j)) - f* | comparisons]
         idx = torch.arange(scores.shape[0])
         scores[idx, idx] = -torch.inf
+        # Диагональ зануляется 
         flat_idx = torch.argmax(scores)
+        # Потом flat index переводится в пару индексов
         i = int(flat_idx // scores.shape[1])
         j = int(flat_idx % scores.shape[1])
-        return candidate_pool[i].item(), candidate_pool[j].item()
+        # argmax_{i != j} scores[i, j]
+        return _candidate_value(candidate_pool[i]), _candidate_value(candidate_pool[j])
 
     def recommend(
         self,
@@ -353,12 +431,13 @@ class PairScorePFNAgent(PBOAgent):
         candidate_pool: torch.Tensor,
     ) -> float:
         if not comparisons:
-            return candidate_pool[candidate_pool.shape[0] // 2].item()
+            return _candidate_value(candidate_pool[candidate_pool.shape[0] // 2])
         scores = self._pair_scores(comparisons, candidate_pool)
         diag = torch.diagonal(scores)
-        return candidate_pool[diag.argmax()].item()
+        return _candidate_value(candidate_pool[diag.argmax()])
 
 
+# TODO: make fixes for multidim
 class CompareCopelandPFNAgent(PairScorePFNAgent):
     """Ranking-only PFN baseline for compare checkpoints."""
 
@@ -409,7 +488,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Evaluate PFN checkpoints and baselines on GP log-regret suites."
     )
-    parser.add_argument("--checkpoint-dirs", nargs="+", default=["checkpoints", "checkpoints2", "checkpoints3"])
+    parser.add_argument(
+        "--checkpoint-dirs",
+        nargs="+",
+        default=["checkpoints", "checkpoints2", "checkpoints3", "checkpoints4"],
+    )
     parser.add_argument("--config-dirs", nargs="+", default=["my_configs", "my_configs2", "my_configs3"])
     parser.add_argument("--out", type=Path, default=Path("results/gp_log_regret/results.pt"))
     parser.add_argument("--budget", type=int, default=60)
@@ -485,6 +568,35 @@ def find_config_paths(config_dirs: Sequence[str]) -> Dict[str, Path]:
     return out
 
 
+def infer_checkpoint_input_dim(name: str) -> int:
+    match = MULTIDIM_CHECKPOINT_RE.match(name)
+    if match is None:
+        return 1
+    return int(match.group(1))
+
+
+def resolve_config_path_for_checkpoint(
+    name: str,
+    config_paths: Mapping[str, Path],
+) -> tuple[Optional[Path], Optional[str]]:
+    if name in config_paths:
+        return config_paths[name], None
+
+    match = MULTIDIM_CHECKPOINT_RE.match(name)
+    if match is None:
+        return None, None
+
+    dim = int(match.group(1))
+    suffix = match.group(2)
+    if dim == 1:
+        return None, None
+
+    template_name = f"pref_gp_1d_{suffix}"
+    if template_name in config_paths:
+        return config_paths[template_name], template_name
+    return None, template_name
+
+
 def classify_checkpoint(name: str) -> str:
     if "vanilla" in name:
         return "vanilla"
@@ -533,29 +645,67 @@ def discover_checkpoints(args: argparse.Namespace) -> tuple[List[CheckpointSpec]
             if kind == "vanilla":
                 skipped[checkpoint_name] = "vanilla GP checkpoint requires direct utility observations"
                 continue
-            if name not in config_paths:
-                skipped[checkpoint_name] = f"missing config train_{name}.py"
+            config_path, config_template_name = resolve_config_path_for_checkpoint(name, config_paths)
+            if config_path is None:
+                if config_template_name is None:
+                    skipped[checkpoint_name] = f"missing config train_{name}.py"
+                else:
+                    skipped[checkpoint_name] = (
+                        f"missing config train_{name}.py and template "
+                        f"train_{config_template_name}.py"
+                    )
                 continue
 
-            hparams, prior_class = load_hparams_from_config(config_paths[name])
+            hparams, prior_class = load_hparams_from_config(config_path)
             method_name = f"{name}_copeland" if kind == "compare" else name
             specs.append(
                 CheckpointSpec(
                     checkpoint_path=checkpoint_path,
-                    config_path=config_paths[name],
+                    config_path=config_path,
                     checkpoint_name=checkpoint_name,
                     method_name=method_name,
                     kind=kind,
                     train_hparams=hparams,
                     prior_class=prior_class,
+                    input_dim=infer_checkpoint_input_dim(name),
+                    config_template_name=config_template_name,
                 )
             )
 
     return specs, skipped
 
 
+def _replace_config_obj(obj, **updates):
+    updates = {key: value for key, value in updates.items() if hasattr(obj, key)}
+    if not updates:
+        return obj
+    if is_dataclass(obj):
+        return replace(obj, **updates)
+    for key, value in updates.items():
+        setattr(obj, key, value)
+    return obj
+
+
+def apply_checkpoint_shape_overrides(config, spec: CheckpointSpec):
+    if spec.input_dim <= 1:
+        return config
+    num_features = 2 * spec.input_dim
+    model = _replace_config_obj(config.model, features_per_group=num_features)
+    batch_shape_sampler = _replace_config_obj(
+        config.batch_shape_sampler,
+        min_num_features=num_features,
+        max_num_features=num_features,
+    )
+    if is_dataclass(config):
+        return replace(config, model=model, batch_shape_sampler=batch_shape_sampler)
+    config.model = model
+    config.batch_shape_sampler = batch_shape_sampler
+    return config
+
+
 def load_pfn_model(spec: CheckpointSpec, device: str):
     config = load_config_from_python(str(spec.config_path), 0)
+    config = apply_checkpoint_shape_overrides(config, spec)
     model = config.model.create_model().to(device)
     model.eval()
     state = torch.load(spec.checkpoint_path, map_location=device)
@@ -570,7 +720,9 @@ def requested_methods(args: argparse.Namespace, checkpoint_specs: Sequence[Check
     pfn_names = [spec.method_name for spec in checkpoint_specs]
     all_names = list(BASELINE_METHODS) + pfn_names
     if args.methods == ["all"]:
-        selected = all_names
+        selected = list(BASELINE_METHODS) + [
+            spec.method_name for spec in checkpoint_specs if spec.input_dim == 1
+        ]
     else:
         requested = set(args.methods)
         selected = [name for name in all_names if name in requested]
@@ -588,12 +740,14 @@ def make_pfn_agent_factory(
             model,
             device=args.device,
             pair_batch_size=args.pfn_pair_batch_size,
+            input_dim=spec.input_dim,
         )
     if spec.kind == "compare":
         return lambda: CompareCopelandPFNAgent(
             model,
             device=args.device,
             pair_batch_size=args.pfn_pair_batch_size,
+            input_dim=spec.input_dim,
         )
     return lambda: UtilityPFNAgent(
         model,
@@ -608,28 +762,46 @@ def build_eval_suite_specs(
 ) -> List[EvalSuiteSpec]:
     suites: List[EvalSuiteSpec] = []
 
+    input_dims = set()
+    for value in list(getattr(args, "methods", [])) + list(getattr(args, "only_checkpoints", [])):
+        name = Path(str(value)).stem.removeprefix("pfn_")
+        match = MULTIDIM_CHECKPOINT_RE.match(name)
+        if match is not None:
+            input_dims.add(int(match.group(1)))
+    if not input_dims:
+        input_dims.add(1)
+
     if args.benchmark_mode in {"gp_only", "all"}:
         for hparams in eval_hparams:
-            gp_functions = tuple(
-                sample_gp_function(
-                    n_grid=args.n_grid,
-                    hparams=hparams,
-                    seed=args.gp_seed_offset + gp_idx,
-                    grid_design=args.grid_design,
-                    grid_seed=args.grid_seed_offset + gp_idx,
+            for input_dim in sorted(input_dims):
+                gp_functions = tuple(
+                    sample_gp_function(
+                        n_grid=args.n_grid,
+                        input_dim=input_dim,
+                        hparams=hparams,
+                        seed=args.gp_seed_offset + gp_idx,
+                        grid_design=args.grid_design,
+                        grid_seed=args.grid_seed_offset + gp_idx,
+                    )
+                    for gp_idx in range(args.n_gp_functions)
                 )
-                for gp_idx in range(args.n_gp_functions)
-            )
-            suites.append(
-                EvalSuiteSpec(
-                    name=hparams.signature,
-                    functions=gp_functions,
-                    oracle_noise_std=hparams.noise_std,
-                    baseline_hparams=hparams,
-                    eval_hparams=hparams,
-                    benchmark=None,
+                suite_name = hparams.signature if input_dim == 1 else f"{hparams.signature}_d{input_dim}"
+                benchmark = None if input_dim == 1 else {
+                    "kind": "gp",
+                    "input_dim": int(input_dim),
+                    "grid_design": args.grid_design,
+                    "grid_seed_offset": int(args.grid_seed_offset),
+                }
+                suites.append(
+                    EvalSuiteSpec(
+                        name=suite_name,
+                        functions=gp_functions,
+                        oracle_noise_std=hparams.noise_std,
+                        baseline_hparams=hparams,
+                        eval_hparams=hparams,
+                        benchmark=benchmark,
+                    )
                 )
-            )
 
     if args.benchmark_mode in {"deterministic_only", "all"}:
         reference_hparams = eval_hparams[0]
@@ -742,7 +914,9 @@ def method_metadata(
         "kind": spec.kind,
         "checkpoint": str(spec.checkpoint_path),
         "config": str(spec.config_path),
+        "config_template_name": spec.config_template_name,
         "prior_class": spec.prior_class,
+        "input_dim": spec.input_dim,
         "train_hparams": spec.train_hparams.as_dict(),
         "eval_hparams": eval_hparams_dict,
         "benchmark": dict(benchmark) if benchmark is not None else None,
@@ -760,6 +934,7 @@ def main() -> None:
     checkpoint_specs, skipped = discover_checkpoints(args)
     spec_by_method = {spec.method_name: spec for spec in checkpoint_specs}
     selected_methods = requested_methods(args, checkpoint_specs)
+    print(f"selected_methods: {selected_methods}")
     if not selected_methods:
         raise RuntimeError("No methods selected for evaluation.")
 

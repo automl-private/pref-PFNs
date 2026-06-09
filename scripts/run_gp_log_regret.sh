@@ -5,7 +5,7 @@ cd "$(dirname "$0")/.."
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
-CHECKPOINT_DIRS="${CHECKPOINT_DIRS:-checkpoints checkpoints2 checkpoints3}"
+CHECKPOINT_DIRS="${CHECKPOINT_DIRS:-checkpoints checkpoints2 checkpoints3 checkpoints4}"
 CONFIG_DIRS="${CONFIG_DIRS:-my_configs my_configs2 my_configs3}"
 OUT="${OUT:-results/gp_log_regret/results.pt}"
 

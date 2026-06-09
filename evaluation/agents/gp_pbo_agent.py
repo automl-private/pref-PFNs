@@ -22,7 +22,13 @@ import math
 import torch
 from torch import Tensor
 
-from .base import PBOAgent, Comparison
+from .base import (
+    PBOAgent,
+    Comparison,
+    candidate_matrix,
+    candidate_value,
+    nearest_candidate_index,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -60,9 +66,9 @@ def _pref_log_lik(
 # ---------------------------------------------------------------------------
 
 def _rbf_kernel(x: Tensor, lengthscale: float, outputscale: float) -> Tensor:
-    """x: (n,) → K: (n, n)"""
-    x = x.unsqueeze(-1)  # (n, 1)
-    sq_dist = (x - x.T) ** 2
+    """x: (n,) or (n, d) -> K: (n, n)."""
+    x = candidate_matrix(x)
+    sq_dist = torch.cdist(x, x).square()
     return outputscale * torch.exp(-0.5 * sq_dist / lengthscale**2)
 
 
@@ -157,7 +163,7 @@ class GPPBOAgent(PBOAgent):
     ) -> tuple[list[int], list[int]]:
         """Map x values to indices in candidate_pool."""
         def snap(x):
-            return (candidate_pool - x).abs().argmin().item()
+            return nearest_candidate_index(candidate_pool, x)
 
         winner_idx = [snap(w) for w, _ in comparisons]
         loser_idx  = [snap(l) for _, l in comparisons]
@@ -180,17 +186,17 @@ class GPPBOAgent(PBOAgent):
         self,
         comparisons: list[Comparison],
         candidate_pool: Tensor,
-    ) -> float:
+    ):
         if not comparisons:
-            return candidate_pool[candidate_pool.shape[0] // 2].item()
+            return candidate_value(candidate_pool[candidate_pool.shape[0] // 2])
         f_mean, _ = self._posterior(comparisons, candidate_pool)
-        return candidate_pool[f_mean.argmax()].item()
+        return candidate_value(candidate_pool[f_mean.argmax()])
 
     def suggest_pair(
         self,
         comparisons: list[Comparison],
         candidate_pool: Tensor,
-    ) -> tuple[float, float]:
+    ) -> tuple:
         f_mean, f_cov = self._posterior(comparisons, candidate_pool)
 
         argmaxes = []
@@ -202,10 +208,10 @@ class GPPBOAgent(PBOAgent):
         )
         for _ in range(self.n_ts_samples):
             sample = dist.sample()
-            argmaxes.append(candidate_pool[sample.argmax()].item())
+            argmaxes.append(candidate_value(candidate_pool[sample.argmax()]))
 
         if len(set(argmaxes)) == 1:
             challenger_idx = torch.randint(len(candidate_pool), (1,)).item()
-            return argmaxes[0], candidate_pool[challenger_idx].item()
+            return argmaxes[0], candidate_value(candidate_pool[challenger_idx])
 
         return argmaxes[0], argmaxes[1]

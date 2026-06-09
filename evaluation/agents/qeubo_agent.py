@@ -13,7 +13,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from .base import PBOAgent, Comparison
+from .base import PBOAgent, Comparison, candidate_matrix, candidate_value
 
 try:
     from botorch.models.pairwise_gp import (
@@ -49,24 +49,30 @@ def _build_pairwise_tensors(
     Convert list of (winner_x, loser_x) into botorch PairwiseGP format.
 
     Returns:
-        datapoints:  (n_unique, 1) — all unique x values seen
+        datapoints:  (n_unique, d) — all unique x values seen
         comparisons: (m, 2) LongTensor — [winner_idx, loser_idx] into datapoints
     """
     # Collect unique x values preserving insertion order
-    seen: dict[float, int] = {}
+    def key(point):
+        tensor = torch.as_tensor(point, dtype=dtype).reshape(-1)
+        return tuple(float(v) for v in tensor.tolist())
+
+    seen: dict[tuple[float, ...], int] = {}
     for w, l in comparisons:
-        if w not in seen:
-            seen[w] = len(seen)
-        if l not in seen:
-            seen[l] = len(seen)
+        wk = key(w)
+        lk = key(l)
+        if wk not in seen:
+            seen[wk] = len(seen)
+        if lk not in seen:
+            seen[lk] = len(seen)
 
     datapoints = torch.tensor(
         sorted(seen.keys(), key=lambda x: seen[x]),
         dtype=dtype,
-    ).unsqueeze(-1)  # (n, 1)
+    )  # (n, d)
 
     comp_idx = torch.tensor(
-        [[seen[w], seen[l]] for w, l in comparisons],
+        [[seen[key(w)], seen[key(l)]] for w, l in comparisons],
         dtype=torch.long,
     )  # (m, 2)
 
@@ -120,9 +126,9 @@ class QEUBOAgent(PBOAgent):
     def _posterior_mean(self, model: "PairwiseGP", candidate_pool: Tensor) -> Tensor:
         """
         Returns posterior mean f(x) for each x in candidate_pool. Shape: (n,)
-        candidate_pool: (n,) 1-D tensor
+        candidate_pool: (n,) or (n, d) tensor
         """
-        X = candidate_pool.to(dtype=self.dtype).unsqueeze(-1)  # (n, 1)
+        X = candidate_matrix(candidate_pool, dtype=self.dtype)
         with torch.no_grad():
             posterior = model.posterior(X)
         return posterior.mean.squeeze(-1).squeeze(-1)  # (n,)
@@ -135,11 +141,11 @@ class QEUBOAgent(PBOAgent):
         self,
         comparisons: list[Comparison],
         candidate_pool: Tensor,
-    ) -> tuple[float, float]:
+    ) -> tuple:
         if not comparisons:
             # No data yet — return a random pair
             idx = torch.randperm(len(candidate_pool))[:2]
-            return candidate_pool[idx[0]].item(), candidate_pool[idx[1]].item()
+            return candidate_value(candidate_pool[idx[0]]), candidate_value(candidate_pool[idx[1]])
 
         model = self._fit_model(comparisons)
 
@@ -147,29 +153,26 @@ class QEUBOAgent(PBOAgent):
         sampler = SobolQMCNormalSampler(sample_shape=torch.Size([self.num_acqf_samples]))
         acqf = qExpectedUtilityOfBestOption(pref_model=model, sampler=sampler)
 
-        # choices: (n_candidates, 1) for 1-D input
-        choices = candidate_pool.to(dtype=self.dtype).unsqueeze(-1)  # (n, 1)
+        choices = candidate_matrix(candidate_pool, dtype=self.dtype)
 
-        # optimize_acqf_discrete with q=2 returns a pair (2, 1)
+        # optimize_acqf_discrete with q=2 returns a pair (2, d)
         X_next, _ = optimize_acqf_discrete(
             acq_function=acqf,
             q=2,
             choices=choices,
             unique=True,
-        )  # X_next: (2, 1)
+        )  # X_next: (2, d)
 
-        x1 = X_next[0, 0].item()
-        x2 = X_next[1, 0].item()
-        return x1, x2
+        return candidate_value(X_next[0]), candidate_value(X_next[1])
 
     def recommend(
         self,
         comparisons: list[Comparison],
         candidate_pool: Tensor,
-    ) -> float:
+    ):
         if not comparisons:
-            return candidate_pool[len(candidate_pool) // 2].item()
+            return candidate_value(candidate_pool[len(candidate_pool) // 2])
 
         model = self._fit_model(comparisons)
         mean = self._posterior_mean(model, candidate_pool)
-        return candidate_pool[mean.argmax()].item()
+        return candidate_value(candidate_pool[mean.argmax()])

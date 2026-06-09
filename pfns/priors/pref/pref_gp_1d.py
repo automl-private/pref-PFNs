@@ -119,7 +119,11 @@ def get_batch(
         best_x = torch.where(prefer_x0, x0, x1)   # (B, 1)
         worst_x = torch.where(prefer_x0, x1, x0)  # (B, 1)
 
-        new_X[:, t, :] = torch.cat([best_x, worst_x], dim=-1)
+        new_X[:, t, :] = torch.cat([best_x, worst_x], dim=-1) # (B, 2)
+    
+    # new_X.shape = (B, single_eval_pos, 2) best is always the first
+    # X_train = pairs
+    # y_train = 0
 
     # Remaining tokens: utility queries [x, 0]
     num_queries = seq_len - single_eval_pos
@@ -131,7 +135,7 @@ def get_batch(
         query_Fs = Fs[:, src_start:src_end]    # (B, num_queries)
         query_Ys = Ys[:, src_start:src_end]    # (B, num_queries)
 
-        new_X[:, single_eval_pos:, :gp_dim] = query_X
+        new_X[:, single_eval_pos:, :gp_dim] = query_X # (B, seq_len, 1), one column is always zero for queries
         # second half remains zero-padded
         new_Fs[:, single_eval_pos:] = query_Fs
         new_Ys[:, single_eval_pos:] = query_Ys

@@ -13,7 +13,7 @@ from collections import Counter
 
 import torch
 
-from .base import PBOAgent, Comparison
+from .base import PBOAgent, Comparison, candidate_value
 
 
 class RandomAgent(PBOAgent):
@@ -24,17 +24,17 @@ class RandomAgent(PBOAgent):
         self,
         comparisons: list[Comparison],
         candidate_pool: torch.Tensor,
-    ) -> tuple[float, float]:
-        pool = candidate_pool.tolist()
-        x1, x2 = self._rng.sample(pool, 2)
-        return x1, x2
+    ) -> tuple:
+        idx1, idx2 = self._rng.sample(range(len(candidate_pool)), 2)
+        return candidate_value(candidate_pool[idx1]), candidate_value(candidate_pool[idx2])
 
     def recommend(
         self,
         comparisons: list[Comparison],
         candidate_pool: torch.Tensor,
-    ) -> float:
+    ):
         if not comparisons:
-            return self._rng.choice(candidate_pool.tolist())
+            idx = self._rng.randrange(len(candidate_pool))
+            return candidate_value(candidate_pool[idx])
         wins = Counter(w for w, _ in comparisons)
         return max(wins, key=wins.get)
