@@ -80,6 +80,23 @@ def display_label(method_name: str, metadata: Mapping) -> str:
 def suite_subtitle(suite: Mapping, *, compact: bool = False) -> str:
     benchmark = suite.get("benchmark")
     if benchmark:
+        if benchmark.get("kind") == "gp":
+            h = suite.get("eval_hparams", {})
+            input_dim = benchmark.get("input_dim")
+            grid_design = benchmark.get("grid_design")
+            grid_seed_offset = benchmark.get("grid_seed_offset")
+            if compact:
+                return (
+                    f"GP prior | d={input_dim} | grid={grid_design} | "
+                    f"l={h.get('lengthscale')}, os={h.get('outputscale')}, "
+                    f"noise={h.get('noise_std')}"
+                )
+            return (
+                f"GP prior, input_dim={input_dim}, grid_design={grid_design}, "
+                f"grid_seed_offset={grid_seed_offset}, "
+                f"lengthscale={h.get('lengthscale')}, "
+                f"outputscale={h.get('outputscale')}, noise_std={h.get('noise_std')}"
+            )
         if compact:
             return (
                 f"{benchmark.get('name')} | {benchmark.get('normalization')} | "
@@ -228,10 +245,15 @@ def write_summary(
                 "benchmark_name",
                 "benchmark_normalization",
                 "benchmark_noise_std",
+                "benchmark_input_dim",
+                "benchmark_grid_design",
+                "benchmark_grid_seed_offset",
                 "method",
                 "kind",
                 "checkpoint",
                 "config",
+                "config_template_name",
+                "method_input_dim",
                 "train_lengthscale",
                 "train_outputscale",
                 "train_noise_std",
@@ -276,10 +298,15 @@ def write_summary(
                             benchmark.get("name"),
                             benchmark.get("normalization"),
                             benchmark.get("noise_std"),
+                            benchmark.get("input_dim"),
+                            benchmark.get("grid_design"),
+                            benchmark.get("grid_seed_offset"),
                             method_name,
                             metadata.get("kind"),
                             metadata.get("checkpoint"),
                             metadata.get("config"),
+                            metadata.get("config_template_name"),
+                            metadata.get("input_dim"),
                             train_h.get("lengthscale"),
                             train_h.get("outputscale"),
                             train_h.get("noise_std"),

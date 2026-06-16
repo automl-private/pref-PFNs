@@ -85,7 +85,11 @@ class FixedHyperparamQEUBOAgent(PBOAgent):
         num_acqf_samples: int = 512,
         batch_eval_size: int = 2048,
         dtype=torch.float64,
+        support: str = "grid",
     ) -> None:
+        assert support == "grid", (
+            "Continuous support is not implemented for FixedHyperparamQEUBOAgent yet."
+        )
         _require_botorch()
         self.lengthscale = float(lengthscale)
         self.outputscale = float(outputscale)
@@ -97,6 +101,7 @@ class FixedHyperparamQEUBOAgent(PBOAgent):
         self.num_acqf_samples = int(num_acqf_samples)
         self.batch_eval_size = int(batch_eval_size)
         self.dtype = dtype
+        self.support = support
 
     def _pool_indices(
         self,

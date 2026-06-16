@@ -151,10 +151,13 @@ class GPPBOAgent(PBOAgent):
         lengthscale: float = 0.2,
         outputscale: float = 1.0,
         n_ts_samples: int = 2,
+        support: str = "grid",
     ):
+        assert support == "grid", "Continuous support is not implemented for GPPBOAgent yet."
         self.lengthscale = lengthscale
         self.outputscale = outputscale
         self.n_ts_samples = n_ts_samples
+        self.support = support
 
     def _pool_indices(
         self,

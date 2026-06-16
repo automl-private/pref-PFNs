@@ -26,7 +26,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, is_dataclass, replace
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import gpytorch
 import torch
@@ -98,67 +98,138 @@ class CheckpointSpec:
 @dataclass(frozen=True)
 class EvalSuiteSpec:
     name: str
-    functions: tuple[tuple[torch.Tensor, torch.Tensor], ...]
+    functions: tuple[Union[tuple[torch.Tensor, torch.Tensor], "SampledGPFunction"], ...]
     oracle_noise_std: float
     baseline_hparams: GPHyperparameters
     eval_hparams: Optional[GPHyperparameters]
     benchmark: Optional[Dict]
 
+@dataclass(frozen=True)
+class SampledGPFunction:
+    support: str
+    input_dim: int
+    hparams: GPHyperparameters
+    seed: int
+    x_grid: Optional[torch.Tensor] = None
+    f_grid: Optional[torch.Tensor] = None
+    rff_weights: Optional[torch.Tensor] = None
+    rff_phases: Optional[torch.Tensor] = None
+    rff_coeffs: Optional[torch.Tensor] = None
+    rff_scale: float = 1.0
+    x_opt: Optional[object] = None
+    f_opt: Optional[float] = None
+
+    def evaluate(self, x, *, batch_size: int = 2048) -> torch.Tensor:
+        x = torch.as_tensor(x, dtype=torch.float32).reshape(-1, self.input_dim) # [N, input_dim]
+
+        if self.support == "grid":
+            if self.x_grid is None or self.f_grid is None:
+                raise ValueError("Grid GP function requires x_grid and f_grid.")
+            grid = self.x_grid.reshape(-1, self.input_dim)
+            # ближайший сосед
+            nearest = torch.cdist(x, grid).argmin(dim=1) # [N, len(grid)], для каждого x находит индекс ближайшей точки сетки
+            return self.f_grid[nearest]
+
+        if self.support != "continuous_rff":
+            raise ValueError(f"Unknown GP function support {self.support!r}.")
+        if self.rff_weights is None or self.rff_phases is None or self.rff_coeffs is None:
+            raise ValueError("Continuous RFF GP function is missing RFF parameters.")
+
+        values: List[torch.Tensor] = []
+        for start in range(0, x.shape[0], batch_size):
+            # Разбивает x на порции размера batch_size (кроме последней)
+            chunk = x[start : start + batch_size]
+            proj = chunk @ self.rff_weights + self.rff_phases
+            values.append(self.rff_scale * (torch.cos(proj) @ self.rff_coeffs))
+        return torch.cat(values)
+
 class GaussianPreferenceOracle:
-    """Fixed-grid oracle with Gaussian comparison noise."""
+    """Oracle with Gaussian comparison noise for grid or continuous GP functions."""
 
     def __init__(
         self,
-        x_grid: torch.Tensor,
-        f_grid: torch.Tensor,
-        noise_std: float,
-        seed: int,
+        x_grid: Optional[torch.Tensor] = None,
+        f_grid: Optional[torch.Tensor] = None,
+        noise_std: float = 0.0,
+        seed: int = 0,
+        *,
+        gp_function: Optional[SampledGPFunction] = None,
     ) -> None:
-        self.x_grid = x_grid.detach().cpu().float()
-        self.f_grid = f_grid.detach().cpu().float()
         self.noise_std = float(noise_std)
         self.seed = int(seed)
         self._rng = torch.Generator(device="cpu")
         self._rng.manual_seed(self.seed)
+        self.gp_function = gp_function
 
-        if self.x_grid.ndim == 1:
-            assert self.x_grid.shape[0] == self.f_grid.shape[0]
-        else:
-            assert self.x_grid.shape[0] == self.f_grid.shape[0]
+        if gp_function is not None:
+            if x_grid is not None or f_grid is not None:
+                raise ValueError("Pass either gp_function or x_grid/f_grid, not both.")
+            if gp_function.x_opt is None or gp_function.f_opt is None:
+                raise ValueError("SampledGPFunction must contain x_opt and f_opt.")
+
+            self.support = gp_function.support
+            self.input_dim = int(gp_function.input_dim)
+            self.x_grid = gp_function.x_grid
+            self.f_grid = gp_function.f_grid
+            self._x_opt = gp_function.x_opt
+            self._f_opt = float(gp_function.f_opt)
+            return
+
+        if x_grid is None or f_grid is None:
+            raise ValueError("Grid oracle requires x_grid and f_grid.")
+
+        self.support = "grid"
+        self.x_grid = x_grid.detach().cpu().float()
+        self.f_grid = f_grid.detach().cpu().float()
+        self.input_dim = 1 if self.x_grid.ndim == 1 else int(self.x_grid.shape[1])
+
+        if self.x_grid.shape[0] != self.f_grid.shape[0]:
+            raise ValueError("x_grid and f_grid must have the same first dimension.")
+
+        best_idx = int(self.f_grid.argmax().item())
+        self._x_opt = self._format_point(self.x_grid[best_idx])
+        self._f_opt = float(self.f_grid[best_idx].item())
 
     @property
     def f_opt(self) -> float:
-        return self.f_grid.max().item()
+        return self._f_opt
 
     @property
     def x_opt(self):
-        # returns tuple of coordinates for the optimal point (x1, x2, ..., xd)
-        return self._format_point(self.x_grid[self.f_grid.argmax()])
-
+        return self._x_opt
+    
     def _point_tensor(self, x) -> torch.Tensor:
-        x = torch.as_tensor(x, dtype=self.x_grid.dtype)
-        # Если oracle 1D, то x_grid.shape == (M,), и точка должна быть scalar tensor
-        if self.x_grid.ndim == 1:
-            return x.reshape(())
-        # А если multidim, то точка приводится к вектору
-        return x.reshape(-1)
+        point = torch.as_tensor(x, dtype=torch.float32).reshape(-1)
+        if point.numel() != self.input_dim:
+            raise ValueError(f"Expected {self.input_dim}D point, got shape {tuple(point.shape)}.")
+        return point
 
     def _nearest_idx(self, x) -> int:
-        x = self._point_tensor(x)
-        if self.x_grid.ndim == 1:
-            return int((self.x_grid - float(x)).abs().argmin().item())
+        if self.support != "grid":
+            raise RuntimeError("_nearest_idx is only valid for grid support.")
+        point = self._point_tensor(x)
+        if self.input_dim == 1 and self.x_grid.ndim == 1:
+            return int((self.x_grid - point[0]).abs().argmin().item())
 
-        distances = torch.linalg.norm(self.x_grid - x, dim=-1)
+        grid = self.x_grid.reshape(-1, self.input_dim)
+        distances = torch.linalg.norm(grid - point, dim=-1)
         return int(distances.argmin().item())
-
+    
     def _format_point(self, x: torch.Tensor):
-        if self.x_grid.ndim == 1:
-            return float(x.item())
-        return tuple(x.detach().cpu().tolist())
+        point = torch.as_tensor(x, dtype=torch.float32).reshape(-1)
+        if self.input_dim == 1:
+            return float(point[0].item())
+        return tuple(float(v) for v in point.tolist())
 
     def f_at(self, x) -> float:
-        idx = self._nearest_idx(x)
-        return self.f_grid[idx].item()
+        point = self._point_tensor(x)
+
+        if self.gp_function is not None:
+            value = self.gp_function.evaluate(point.reshape(1, self.input_dim))
+            return float(value.reshape(-1)[0].item())
+
+        idx = self._nearest_idx(point)
+        return float(self.f_grid[idx].item())
 
     def compare(self, x1, x2):
         f1 = self.f_at(x1)
@@ -185,46 +256,125 @@ def sample_gp_function(
     grid_design: str = "uniform",
     grid_seed: int = 0,
     jitter: float = 1e-6,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sample a noiseless latent GP path on a fixed candidate set."""
+    support: str = "grid",
+    rff_num_features: int = 4096,
+    opt_reference_size: int = 65536,
+    opt_reference_seed: Optional[int] = None,
+    rff_eval_batch_size: int = 2048,
+) -> Union[Tuple[torch.Tensor, torch.Tensor], SampledGPFunction]:
+    """Sample a noiseless latent GP benchmark.
+
+    support="grid" preserves the old exact finite-grid GP sample.
+    support="continuous_rff" returns an approximate continuous RBF GP path.
+    """
     if input_dim < 1:
         raise ValueError(f"input_dim must be positive, got {input_dim}")
-    if input_dim == 1:
-        x_eval = make_1d_grid(n_grid, design=grid_design, seed=grid_seed, dtype=torch.double)
-        x_kernel = x_eval.unsqueeze(-1)
-    else:
-        generator = torch.Generator(device="cpu")
-        generator.manual_seed(int(grid_seed))
-        if grid_design == "lhs":
-            base = torch.arange(n_grid, dtype=torch.double).unsqueeze(-1)
-            offsets = torch.rand(n_grid, input_dim, generator=generator, dtype=torch.double)
-            x_kernel = (base + offsets) / float(n_grid)
-            for dim in range(input_dim):
-                perm = torch.randperm(n_grid, generator=generator)
-                x_kernel[:, dim] = x_kernel[perm, dim]
+    if support == "grid":
+        if input_dim == 1:
+            x_eval = make_1d_grid(n_grid, design=grid_design, seed=grid_seed, dtype=torch.double)
+            x_kernel = x_eval.unsqueeze(-1)
         else:
-            x_kernel = torch.rand(n_grid, input_dim, generator=generator, dtype=torch.double)
-        x_eval = x_kernel
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(int(grid_seed))
+            if grid_design == "lhs":
+                base = torch.arange(n_grid, dtype=torch.double).unsqueeze(-1)
+                offsets = torch.rand(n_grid, input_dim, generator=generator, dtype=torch.double)
+                x_kernel = (base + offsets) / float(n_grid)
+                for dim in range(input_dim):
+                    perm = torch.randperm(n_grid, generator=generator)
+                    x_kernel[:, dim] = x_kernel[perm, dim]
+            else:
+                x_kernel = torch.rand(n_grid, input_dim, generator=generator, dtype=torch.double)
+            x_eval = x_kernel
 
-    base_kernel = gpytorch.kernels.RBFKernel(ard_num_dims=input_dim)
-    base_kernel.lengthscale = hparams.lengthscale
-    covar_module = gpytorch.kernels.ScaleKernel(base_kernel)
-    covar_module.outputscale = hparams.outputscale
+        base_kernel = gpytorch.kernels.RBFKernel(ard_num_dims=input_dim)
+        base_kernel.lengthscale = hparams.lengthscale
+        covar_module = gpytorch.kernels.ScaleKernel(base_kernel)
+        covar_module.outputscale = hparams.outputscale
 
-    mean = torch.zeros(n_grid, dtype=torch.double)
-    covar = covar_module(x_kernel).add_jitter(jitter)
-    cov = covar.to_dense() if hasattr(covar, "to_dense") else covar.evaluate()
-    dist = torch.distributions.MultivariateNormal(mean, cov)
+        mean = torch.zeros(n_grid, dtype=torch.double)
+        covar = covar_module(x_kernel).add_jitter(jitter)
+        cov = covar.to_dense() if hasattr(covar, "to_dense") else covar.evaluate()
+        dist = torch.distributions.MultivariateNormal(mean, cov)
 
-    old_state = torch.random.get_rng_state()
-    torch.manual_seed(seed)
-    try:
-        with torch.no_grad():
-            f = dist.sample()
-    finally:
-        torch.random.set_rng_state(old_state)
+        old_state = torch.random.get_rng_state()
+        torch.manual_seed(seed)
+        try:
+            with torch.no_grad():
+                f = dist.sample()
+        finally:
+            torch.random.set_rng_state(old_state)
 
-    return x_eval.float(), f.float()
+        return x_eval.float(), f.float()
+    
+    if support != "continuous_rff":
+        raise ValueError(f"Unknown GP function support {support!r}.")
+
+    if rff_num_features < 1:
+        # количество базисных функций
+        raise ValueError("rff_num_features must be positive.")
+    if opt_reference_size < 1:
+        # размер опорной выборки для поиска оптимума
+        raise ValueError("opt_reference_size must be positive.")
+
+    path_rng = torch.Generator(device="cpu")
+    path_rng.manual_seed(int(seed))
+
+    # Для RBF-ядра спектральная плотность – гауссовская
+    # Генерируем матрицу [input_dim, rff_num_features], каждый элемент ~ N(0,1), затем делим на длину масштаба lengthscale
+    # спектральная плотность RBF – тоже гауссовская с обратной ковариацией
+    # Спектральная плотность RBF — это преобразование Фурье экспоненциально-квадратичной ковариационной функции.
+    rff_weights = (
+        torch.randn(input_dim, rff_num_features, generator=path_rng)
+        / float(hparams.lengthscale)
+    ) # [input_dim, rff_num_features]
+    # Генерируем случайные сдвиги равномерно на [0,2π].
+    rff_phases = 2.0 * math.pi * torch.rand(rff_num_features, generator=path_rng) # [rff_num_features]
+    # независимая стандартная нормальная случайная величина
+    rff_coeffs = torch.randn(rff_num_features, generator=path_rng)
+    # sqrt(2 / GP variance)
+    rff_scale = math.sqrt(2.0 * float(hparams.outputscale) / float(rff_num_features))
+
+    # x_grid, f_grid остаются None
+    sampled = SampledGPFunction(
+        support="continuous_rff",
+        input_dim=input_dim,
+        hparams=hparams,
+        seed=int(seed),
+        rff_weights=rff_weights.float(),
+        rff_phases=rff_phases.float(),
+        rff_coeffs=rff_coeffs.float(),
+        rff_scale=rff_scale,
+    )
+
+    if opt_reference_seed is None:
+        opt_reference_seed = int(seed) + 1_000_003
+
+    # последовательность Соболя для 
+    sobol = torch.quasirandom.SobolEngine(
+        dimension=input_dim,
+        scramble=True,
+        seed=int(opt_reference_seed),
+    )
+    x_reference = sobol.draw(int(opt_reference_size)).float()
+    # Вычисление значений GP на этих точках
+    f_reference = sampled.evaluate(x_reference, batch_size=rff_eval_batch_size)
+
+    # Поиск точки с максимальным значением
+    best_idx = int(f_reference.argmax().item())
+    best_x = x_reference[best_idx]
+    # Для одномерного случая возвращается число с плавающей точкой; для многомерного – кортеж чисел
+    x_opt = (
+        float(best_x[0].item())
+        if input_dim == 1
+        else tuple(float(v) for v in best_x.tolist())
+    )
+
+    return replace(
+        sampled,
+        x_opt=x_opt,
+        f_opt=float(f_reference[best_idx].item()),
+    )
 
 
 def _build_pref_context(
@@ -345,7 +495,15 @@ class UtilityPFNAgent(PBOAgent):
 
 
 class PairScorePFNAgent(PBOAgent):
-    """PFN agent for pair-valued qEUBO or qEUBO-negative-regret predictions."""
+    """
+    PFN-агент для checkpoint'ов, которые напрямую скорят пару точек.
+
+    В `support="grid"` сохраняет старое поведение: считает полную матрицу
+    pair-score'ов на переданном `candidate_pool`. В `support="continuous_rff"`
+    работает как batched candidate-set optimizer: сначала скорит диагональ
+    `(x, x)` на большом continuous pool, затем rerank'ит полный набор пар только
+    на shortlist из top-k и exploration-точек.
+    """
 
     def __init__(
         self,
@@ -354,87 +512,229 @@ class PairScorePFNAgent(PBOAgent):
         device: str,
         pair_batch_size: int,
         input_dim: int,
+        support: str = "grid",
+        continuous_top_k: int = 64,
+        continuous_explore_k: int = 64,
     ) -> None:
+        """
+        Инициализирует pair-score PFN и параметры continuous shortlist-поиска.
+
+        Args:
+            model: Обученная PFN-модель с `criterion`.
+            device: Устройство для forward pass'ов PFN.
+            pair_batch_size: Сколько пар отправлять в PFN за один batch.
+            input_dim: Размерность одной точки; вход пары имеет размер
+                `2 * input_dim`.
+            support: `"grid"` для старого полного перебора или
+                `"continuous_rff"` для shortlist/reranking по continuous pool.
+            continuous_top_k: Сколько лучших точек по диагональному score
+                брать в shortlist.
+            continuous_explore_k: Сколько случайных exploration-точек добавлять
+                в shortlist.
+        """
         self.model = model
         self.model.eval()
         self.device = torch.device(device)
         self.criterion = model.criterion
         self.pair_batch_size = int(pair_batch_size)
         self.input_dim = int(input_dim)
+        self.support = support
+        self.continuous_top_k = int(continuous_top_k)
+        self.continuous_explore_k = int(continuous_explore_k)
 
     @property
     def dtype(self) -> torch.dtype:
         return next(self.model.parameters()).dtype
 
-    def _pair_scores(
-        self,
-        comparisons: list[Comparison],
-        candidate_pool: torch.Tensor,
-    ) -> torch.Tensor:
+    def _candidate_matrix(self, candidate_pool: torch.Tensor) -> torch.Tensor:
+        """
+        Приводит candidate pool к матрице shape `(M, input_dim)`.
+
+        Для одномерного pool shape `(M,)` добавляет последнюю размерность, а для
+        многомерного pool сохраняет первую размерность как число кандидатов.
+        """
         x = candidate_pool.to(dtype=self.dtype, device=self.device)
         if x.ndim == 1:
-            M = x.numel()
-            x1, x2 = torch.meshgrid(x, x, indexing="ij")
-            pairs = torch.stack([x1.reshape(-1), x2.reshape(-1)], dim=-1)
-        else:
-            M = x.shape[0]
-            x1 = x.repeat_interleave(M, dim=0)
-            x2 = x.repeat(M, 1)
-            pairs = torch.cat([x1, x2], dim=-1)
+            return x.unsqueeze(-1)
+        return x.reshape(x.shape[0], -1)
+
+    def _score_pair_tensor(
+        self,
+        comparisons: list[Comparison],
+        pairs: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Скорит произвольный список пар через PFN.
+
+        Args:
+            comparisons: История наблюденных сравнений `(winner, loser)`.
+            pairs: Tensor shape `(N, 2 * input_dim)`, где каждая строка это
+                конкатенация `[x_1, x_2]`.
+
+        Returns:
+            Tensor shape `(N,)` с mean score из PFN criterion для каждой пары.
+        """
+        pairs = pairs.to(dtype=self.dtype, device=self.device)
+        expected_dim = self.input_dim * 2
+        if pairs.ndim != 2 or pairs.shape[-1] != expected_dim:
+            raise ValueError(
+                f"Expected pairs with shape (N, {expected_dim}), got {tuple(pairs.shape)}."
+            )
 
         x_ctx, y_ctx = _build_pref_context(
             comparisons,
             dtype=self.dtype,
             device=self.device,
-            input_dims=self.input_dim*2
+            input_dims=expected_dim,
         )
-        # 1D x (4,)      x1 (4, 4)   x2 (4, 4)   pairs (16, 2)
-        # 2D x (4, 2)   x1 (16, 2)  x2 (16, 2)  pairs (16, 4)
 
-        # Определяет, сколько пар отправлять в PFN за один forward pass.
         batch_size = pairs.shape[0] if self.pair_batch_size <= 0 else self.pair_batch_size
-
         chunks: List[torch.Tensor] = []
         with torch.no_grad():
             for start in range(0, pairs.shape[0], batch_size):
                 test_x = pairs[start : start + batch_size].unsqueeze(0)
                 logits = self.model(x_ctx, y_ctx, test_x=test_x)
                 chunks.append(self.criterion.mean(logits)[0].detach().cpu())
+        return torch.cat(chunks)
 
-        return torch.cat(chunks).reshape(M, M)
+    def _diag_scores(
+        self,
+        comparisons: list[Comparison],
+        candidate_pool: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Считает score для диагональных пар `(x, x)` по всем кандидатам.
+
+        В continuous режиме это дешевый proxy для качества одиночной точки:
+        `recommend` берет argmax этих score'ов, а `suggest_pair` использует их
+        для отбора shortlist перед полным pairwise reranking.
+        """
+        x = self._candidate_matrix(candidate_pool)
+        pairs = torch.cat([x, x], dim=-1)
+        return self._score_pair_tensor(comparisons, pairs)
+
+    def _pair_scores(
+        self,
+        comparisons: list[Comparison],
+        candidate_pool: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Строит и скорит полную матрицу пар из одного candidate pool.
+
+        Возвращает `scores` shape `(M, M)`, где `scores[i, j]` соответствует
+        PFN-score пары `(candidate_pool[i], candidate_pool[j])`.
+        """
+        x = self._candidate_matrix(candidate_pool)
+        M = x.shape[0]
+        x1 = x.repeat_interleave(M, dim=0)
+        x2 = x.repeat(M, 1)
+        pairs = torch.cat([x1, x2], dim=-1)
+        # 1D x (4,)      x1 (4, 4)   x2 (4, 4)   pairs (16, 2)
+        # 2D x (4, 2)   x1 (16, 2)  x2 (16, 2)  pairs (16, 4)
+        return self._score_pair_tensor(comparisons, pairs).reshape(M, M)
+
+    def _continuous_shortlist(
+        self,
+        comparisons: list[Comparison],
+        candidate_pool: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Формирует shortlist для continuous pair-search.
+
+        Сначала берет `continuous_top_k` лучших точек по диагональному score
+        `(x, x)`, затем добавляет `continuous_explore_k` случайных точек из
+        исходного pool и удаляет дубликаты. Это снижает стоимость pair search
+        с полного `M x M` до `K x K`.
+        """
+        M = len(candidate_pool)
+        diag_scores = self._diag_scores(comparisons, candidate_pool)
+        top_k = min(M, max(1, self.continuous_top_k))
+        explore_k = min(M, max(0, self.continuous_explore_k))
+
+        selected = [int(i) for i in torch.topk(diag_scores, k=top_k).indices.tolist()]
+        if explore_k > 0:
+            selected.extend(int(i) for i in torch.randperm(M)[:explore_k].tolist())
+
+        unique_indices: List[int] = []
+        seen = set()
+        for idx in selected:
+            if idx not in seen:
+                unique_indices.append(idx)
+                seen.add(idx)
+
+        if len(unique_indices) < min(2, M):
+            for idx in torch.randperm(M).tolist():
+                idx = int(idx)
+                if idx not in seen:
+                    unique_indices.append(idx)
+                    seen.add(idx)
+                if len(unique_indices) >= min(2, M):
+                    break
+
+        shortlist_idx = torch.tensor(unique_indices, dtype=torch.long)
+        return candidate_pool[shortlist_idx]
 
     def suggest_pair(
         self,
         comparisons: list[Comparison],
         candidate_pool: torch.Tensor,
     ) -> tuple[float, float]:
+        """
+        Выбирает следующую пару для oracle comparison.
+
+        В grid режиме делает старый полный argmax по матрице pair-score'ов на
+        `candidate_pool`. В continuous режиме сначала строит shortlist, затем
+        скорит все пары внутри него и возвращает лучшую недиагональную пару.
+        """
         if not comparisons:
             idx = torch.randperm(len(candidate_pool))[:2]
             return _candidate_value(candidate_pool[idx[0]]), _candidate_value(candidate_pool[idx[1]])
 
-        scores = self._pair_scores(comparisons, candidate_pool)
+        if self.support == "grid":
+            scores = self._pair_scores(comparisons, candidate_pool)
+            pool = candidate_pool
+        elif self.support == "continuous_rff":
+            pool = self._continuous_shortlist(comparisons, candidate_pool)
+            scores = self._pair_scores(comparisons, pool)
+        else:
+            raise ValueError(f"Unknown PairScorePFNAgent support {self.support!r}.")
+
         # scores[i, j] ≈ E[max(f(x_i), f(x_j)) | comparisons]
         # scores[i, j] ≈ E[max(f(x_i), f(x_j)) - f* | comparisons]
         idx = torch.arange(scores.shape[0])
         scores[idx, idx] = -torch.inf
         # Диагональ зануляется 
-        flat_idx = torch.argmax(scores)
+        flat_idx = int(torch.argmax(scores).item())
         # Потом flat index переводится в пару индексов
         i = int(flat_idx // scores.shape[1])
         j = int(flat_idx % scores.shape[1])
         # argmax_{i != j} scores[i, j]
-        return _candidate_value(candidate_pool[i]), _candidate_value(candidate_pool[j])
+        return _candidate_value(pool[i]), _candidate_value(pool[j])
 
     def recommend(
         self,
         comparisons: list[Comparison],
         candidate_pool: torch.Tensor,
     ) -> float:
+        """
+        Возвращает текущую рекомендацию лучшей точки.
+
+        В grid режиме сохраняет старую логику: берет диагональ полной pair-score
+        матрицы. В continuous режиме не строит `M x M`; скорит только диагональ
+        `(x, x)` на большом `candidate_pool` и возвращает argmax.
+        """
         if not comparisons:
             return _candidate_value(candidate_pool[candidate_pool.shape[0] // 2])
-        scores = self._pair_scores(comparisons, candidate_pool)
-        diag = torch.diagonal(scores)
-        return _candidate_value(candidate_pool[diag.argmax()])
+        if self.support == "grid":
+            scores = self._pair_scores(comparisons, candidate_pool)
+            diag = torch.diagonal(scores)
+            return _candidate_value(candidate_pool[diag.argmax()])
+
+        if self.support == "continuous_rff":
+            diag = self._diag_scores(comparisons, candidate_pool)
+            return _candidate_value(candidate_pool[diag.argmax()])
+
+        raise ValueError(f"Unknown PairScorePFNAgent support {self.support!r}.")
 
 
 # TODO: make fixes for multidim
@@ -502,6 +802,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-grid", type=int, default=500)
     parser.add_argument("--grid-design", choices=("uniform", "lhs"), default="uniform")
     parser.add_argument("--grid-seed-offset", type=int, default=20_000)
+    parser.add_argument(
+        "--gp-support",
+        choices=("grid", "continuous_rff"),
+        default="grid",
+        help="Latent GP benchmark support. 'grid' preserves existing fixed-candidate evaluation.",
+    )
+    parser.add_argument("--gp-jitter", type=float, default=1e-6)
+    parser.add_argument("--gp-rff-num-features", type=int, default=4096)
+    parser.add_argument("--gp-opt-reference-size", type=int, default=65536)
+    parser.add_argument(
+        "--gp-opt-reference-seed-offset",
+        type=int,
+        default=None,
+        help="Optional seed offset for continuous GP optimum reference sets.",
+    )
+    parser.add_argument("--gp-rff-eval-batch-size", type=int, default=2048)
     parser.add_argument("--eps", type=float, default=1e-12)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--pfn-ts-samples", type=int, default=2)
@@ -735,12 +1051,20 @@ def make_pfn_agent_factory(
     model,
     args: argparse.Namespace,
 ) -> Callable[[], PBOAgent]:
+    """
+    Создает factory для PFN-агента соответствующего checkpoint'а.
+
+    Для pair-score PFN передает `args.gp_support`, чтобы qEUBO/qEUBO-regret
+    checkpoint'и автоматически использовали grid или continuous ветку агента
+    в зависимости от support текущего GP benchmark.
+    """
     if spec.kind in {"qeubo", "qeubo_regret"}:
         return lambda: PairScorePFNAgent(
             model,
             device=args.device,
             pair_batch_size=args.pfn_pair_batch_size,
             input_dim=spec.input_dim,
+            support=args.gp_support,
         )
     if spec.kind == "compare":
         return lambda: CompareCopelandPFNAgent(
@@ -774,24 +1098,49 @@ def build_eval_suite_specs(
     if args.benchmark_mode in {"gp_only", "all"}:
         for hparams in eval_hparams:
             for input_dim in sorted(input_dims):
-                gp_functions = tuple(
-                    sample_gp_function(
-                        n_grid=args.n_grid,
-                        input_dim=input_dim,
-                        hparams=hparams,
-                        seed=args.gp_seed_offset + gp_idx,
-                        grid_design=args.grid_design,
-                        grid_seed=args.grid_seed_offset + gp_idx,
+                gp_functions = []
+                for gp_idx in range(args.n_gp_functions):
+                    opt_reference_seed = None
+                    if args.gp_opt_reference_seed_offset is not None:
+                        opt_reference_seed = args.gp_opt_reference_seed_offset + gp_idx
+
+                    gp_functions.append(
+                        sample_gp_function(
+                            n_grid=args.n_grid,
+                            input_dim=input_dim,
+                            hparams=hparams,
+                            seed=args.gp_seed_offset + gp_idx,
+                            grid_design=args.grid_design,
+                            grid_seed=args.grid_seed_offset + gp_idx,
+                            jitter=args.gp_jitter,
+                            support=args.gp_support,
+                            rff_num_features=args.gp_rff_num_features,
+                            opt_reference_size=args.gp_opt_reference_size,
+                            opt_reference_seed=opt_reference_seed,
+                            rff_eval_batch_size=args.gp_rff_eval_batch_size,
+                        )
                     )
-                    for gp_idx in range(args.n_gp_functions)
-                )
+                gp_functions = tuple(gp_functions)
                 suite_name = hparams.signature if input_dim == 1 else f"{hparams.signature}_d{input_dim}"
-                benchmark = None if input_dim == 1 else {
-                    "kind": "gp",
-                    "input_dim": int(input_dim),
-                    "grid_design": args.grid_design,
-                    "grid_seed_offset": int(args.grid_seed_offset),
-                }
+                benchmark = None
+                if input_dim != 1 or args.gp_support != "grid":
+                    benchmark = {
+                        "kind": "gp",
+                        "input_dim": int(input_dim),
+                        "support": args.gp_support,
+                        "grid_design": args.grid_design,
+                        "grid_seed_offset": int(args.grid_seed_offset),
+                        "gp_seed_offset": int(args.gp_seed_offset),
+                    }
+                    if args.gp_support == "continuous_rff":
+                        benchmark.update(
+                            {
+                                "rff_num_features": int(args.gp_rff_num_features),
+                                "opt_reference_size": int(args.gp_opt_reference_size),
+                                "opt_reference_seed_offset": args.gp_opt_reference_seed_offset,
+                                "rff_eval_batch_size": int(args.gp_rff_eval_batch_size),
+                            }
+                        )
                 suites.append(
                     EvalSuiteSpec(
                         name=suite_name,
@@ -852,17 +1201,19 @@ def make_agent_for_method(
     bo_seed: int,
 ) -> PBOAgent:
     if method_name == "random":
-        return RandomAgent(seed=bo_seed)
+        return RandomAgent(seed=bo_seed, support=args.gp_support)
     if method_name == "gp_pbo":
         return GPPBOAgent(
             lengthscale=hparams.lengthscale,
             outputscale=hparams.outputscale,
+            support=args.gp_support,
         )
     if method_name == "qeubo":
         return QEUBOAgent(
             fit_hyperparams=args.qeubo_fit_hyperparams,
             max_fit_iter=args.qeubo_max_fit_iter,
             num_acqf_samples=args.qeubo_num_acqf_samples,
+            support=args.gp_support,
         )
     if method_name == "fixed_qeubo":
         return FixedHyperparamQEUBOAgent(
@@ -875,6 +1226,7 @@ def make_agent_for_method(
             maxfev=args.fixed_qeubo_maxfev,
             num_acqf_samples=args.fixed_qeubo_mc_samples,
             batch_eval_size=args.fixed_qeubo_batch_eval_size,
+            support=args.gp_support,
         )
     return pfn_factories[method_name]()
 
@@ -976,6 +1328,12 @@ def main() -> None:
             "n_bo_seeds": args.n_bo_seeds,
             "grid_design": args.grid_design,
             "grid_seed_offset": args.grid_seed_offset,
+            "gp_support": args.gp_support,
+            "gp_jitter": args.gp_jitter,
+            "gp_rff_num_features": args.gp_rff_num_features,
+            "gp_opt_reference_size": args.gp_opt_reference_size,
+            "gp_opt_reference_seed_offset": args.gp_opt_reference_seed_offset,
+            "gp_rff_eval_batch_size": args.gp_rff_eval_batch_size,
             "eps": args.eps,
             "device": args.device,
             "selected_methods": selected_methods,
@@ -1003,15 +1361,24 @@ def main() -> None:
             simple_regret = torch.empty(n_functions, args.n_bo_seeds, args.budget)
             utility_at_recommendation = torch.empty_like(simple_regret)
 
-            for function_idx, (x_grid, f_grid) in enumerate(suite_spec.functions):
+            for function_idx, gp_function in enumerate(suite_spec.functions):
                 for bo_seed in range(args.n_bo_seeds):
                     seed = args.oracle_seed_offset + function_idx * 100_000 + bo_seed
-                    oracle = GaussianPreferenceOracle(
-                        x_grid=x_grid,
-                        f_grid=f_grid,
-                        noise_std=suite_spec.oracle_noise_std,
-                        seed=seed,
-                    )
+
+                    if isinstance(gp_function, SampledGPFunction):
+                        oracle = GaussianPreferenceOracle(
+                            gp_function=gp_function,
+                            noise_std=suite_spec.oracle_noise_std,
+                            seed=seed,
+                        )
+                    else:
+                        x_grid, f_grid = gp_function
+                        oracle = GaussianPreferenceOracle(
+                            x_grid=x_grid,
+                            f_grid=f_grid,
+                            noise_std=suite_spec.oracle_noise_std,
+                            seed=seed,
+                        )
 
                     agent = make_agent_for_method(
                         method_name,
@@ -1027,6 +1394,7 @@ def main() -> None:
                         budget=args.budget,
                         n_init=args.n_init,
                         seed=bo_seed,
+                        n_grid=args.n_grid,
                         verbose=args.verbose,
                     )
                     sr = torch.tensor(run["simple_regret"], dtype=torch.float32)

@@ -16,6 +16,7 @@ N_BO_SEEDS="${N_BO_SEEDS:-10}"
 N_GRID="${N_GRID:-500}"
 GRID_DESIGN="${GRID_DESIGN:-uniform}"
 GRID_SEED_OFFSET="${GRID_SEED_OFFSET:-20000}"
+GP_SUPPORT="${GP_SUPPORT:-grid}"
 EPS="${EPS:-1e-12}"
 DEVICE="${DEVICE:-cpu}"
 
@@ -49,6 +50,7 @@ cmd=(
   --n-grid "${N_GRID}"
   --grid-design "${GRID_DESIGN}"
   --grid-seed-offset "${GRID_SEED_OFFSET}"
+  --gp-support "${GP_SUPPORT}"
   --eps "${EPS}"
   --device "${DEVICE}"
   --pfn-ts-samples "${PFN_TS_SAMPLES}"
@@ -96,6 +98,6 @@ fi
 
 echo "[run gp log regret] out=${OUT}"
 echo "[run gp log regret] budget=${BUDGET} n_gp_functions=${N_GP_FUNCTIONS} n_bo_seeds=${N_BO_SEEDS} n_grid=${N_GRID}"
-echo "[run gp log regret] grid_design=${GRID_DESIGN} grid_seed_offset=${GRID_SEED_OFFSET}"
+echo "[run gp log regret] grid_design=${GRID_DESIGN} grid_seed_offset=${GRID_SEED_OFFSET} gp_support=${GP_SUPPORT}"
 echo "[run gp log regret] benchmark_mode=${BENCHMARK_MODE} deterministic_benchmarks=${DETERMINISTIC_BENCHMARKS:-default} deterministic_normalizations=${DETERMINISTIC_NORMALIZATIONS}"
 "${cmd[@]}"
