@@ -5,8 +5,9 @@ cd "$(dirname "$0")/.."
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
-CHECKPOINT_DIRS="${CHECKPOINT_DIRS:-checkpoints checkpoints2 checkpoints3 checkpoints4}"
-CONFIG_DIRS="${CONFIG_DIRS:-my_configs my_configs2 my_configs3}"
+PFN_CHECKPOINT="${PFN_CHECKPOINT:-}"
+PFN_CONFIG="${PFN_CONFIG:-}"
+INPUT_DIM="${INPUT_DIM:-1}"
 OUT="${OUT:-results/gp_log_regret/results.pt}"
 
 BUDGET="${BUDGET:-60}"
@@ -20,7 +21,6 @@ GP_SUPPORT="${GP_SUPPORT:-grid}"
 EPS="${EPS:-1e-12}"
 DEVICE="${DEVICE:-cpu}"
 
-PFN_TS_SAMPLES="${PFN_TS_SAMPLES:-2}"
 PFN_PAIR_BATCH_SIZE="${PFN_PAIR_BATCH_SIZE:-4096}"
 QEUBO_NUM_ACQF_SAMPLES="${QEUBO_NUM_ACQF_SAMPLES:-512}"
 QEUBO_MAX_FIT_ITER="${QEUBO_MAX_FIT_ITER:-100}"
@@ -40,8 +40,7 @@ DETERMINISTIC_NOISE_STD="${DETERMINISTIC_NOISE_STD:-0.05}"
 
 cmd=(
   "${PYTHON_BIN}" evaluation/run_gp_log_regret.py
-  --checkpoint-dirs ${CHECKPOINT_DIRS}
-  --config-dirs ${CONFIG_DIRS}
+  --input-dim "${INPUT_DIM}"
   --out "${OUT}"
   --budget "${BUDGET}"
   --n-init "${N_INIT}"
@@ -53,7 +52,6 @@ cmd=(
   --gp-support "${GP_SUPPORT}"
   --eps "${EPS}"
   --device "${DEVICE}"
-  --pfn-ts-samples "${PFN_TS_SAMPLES}"
   --pfn-pair-batch-size "${PFN_PAIR_BATCH_SIZE}"
   --qeubo-num-acqf-samples "${QEUBO_NUM_ACQF_SAMPLES}"
   --qeubo-max-fit-iter "${QEUBO_MAX_FIT_ITER}"
@@ -68,6 +66,13 @@ cmd=(
   --deterministic-noise-std "${DETERMINISTIC_NOISE_STD}"
 )
 
+if [[ -n "${PFN_CHECKPOINT}" ]]; then
+  cmd+=(--pfn-checkpoint "${PFN_CHECKPOINT}")
+fi
+if [[ -n "${PFN_CONFIG}" ]]; then
+  cmd+=(--pfn-config "${PFN_CONFIG}")
+fi
+
 if [[ -n "${DETERMINISTIC_BENCHMARKS}" ]]; then
   cmd+=(--deterministic-benchmarks ${DETERMINISTIC_BENCHMARKS})
 fi
@@ -77,20 +82,13 @@ if [[ "${QEUBO_FIT_HYPERPARAMS}" == "1" ]]; then
 fi
 
 # Optional filters:
-#   METHODS="random gp_pbo qeubo fixed_qeubo pref_gp_1d_10M" bash scripts/run_gp_log_regret.sh
-#   ONLY_CHECKPOINTS="pfn_pref_gp_1d_10M.pt pfn_pref_gp_1d_qeubo_10M.pt" bash ...
+#   METHODS="random gp_pbo qeubo fixed_qeubo pfn" bash scripts/run_gp_log_regret.sh
 #   EXCLUDE_METHODS="qeubo" bash ...
 if [[ -n "${METHODS:-}" ]]; then
   cmd+=(--methods ${METHODS})
 fi
-if [[ -n "${ONLY_CHECKPOINTS:-}" ]]; then
-  cmd+=(--only-checkpoints ${ONLY_CHECKPOINTS})
-fi
 if [[ -n "${EXCLUDE_METHODS:-}" ]]; then
   cmd+=(--exclude-methods ${EXCLUDE_METHODS})
-fi
-if [[ -n "${SKIP_CHECKPOINTS:-}" ]]; then
-  cmd+=(--skip-checkpoints ${SKIP_CHECKPOINTS})
 fi
 if [[ -n "${VERBOSE:-}" ]]; then
   cmd+=(--verbose)
@@ -98,6 +96,7 @@ fi
 
 echo "[run gp log regret] out=${OUT}"
 echo "[run gp log regret] budget=${BUDGET} n_gp_functions=${N_GP_FUNCTIONS} n_bo_seeds=${N_BO_SEEDS} n_grid=${N_GRID}"
-echo "[run gp log regret] grid_design=${GRID_DESIGN} grid_seed_offset=${GRID_SEED_OFFSET} gp_support=${GP_SUPPORT}"
+echo "[run gp log regret] input_dim=${INPUT_DIM} grid_design=${GRID_DESIGN} grid_seed_offset=${GRID_SEED_OFFSET} gp_support=${GP_SUPPORT}"
+echo "[run gp log regret] pfn_checkpoint=${PFN_CHECKPOINT:-none} pfn_config=${PFN_CONFIG:-none}"
 echo "[run gp log regret] benchmark_mode=${BENCHMARK_MODE} deterministic_benchmarks=${DETERMINISTIC_BENCHMARKS:-default} deterministic_normalizations=${DETERMINISTIC_NORMALIZATIONS}"
 "${cmd[@]}"

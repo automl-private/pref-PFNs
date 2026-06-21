@@ -9,17 +9,7 @@ import random
 
 import torch
 
-from .agents.base import PBOAgent, Comparison
-
-
-def _candidate_value(candidate):
-    """Convert a grid tensor row to a scalar float or multidim point tuple."""
-    candidate = torch.as_tensor(candidate)
-    if candidate.ndim == 0 or candidate.numel() == 1:
-        # Превращает scalar tensor в обычный Python float
-        return float(candidate.reshape(-1)[0].item())
-    # плоский вектор
-    return tuple(float(v) for v in candidate.reshape(-1).tolist())
+from .agents.base import PBOAgent, Comparison, Point, candidate_value
 
 def _point_str(point) -> str:
     """Format scalar or multidim points for verbose BO-loop logging."""
@@ -76,7 +66,7 @@ def run_bo_loop(
     Returns dict:
         {
             "simple_regret": list[float],   # length = budget
-            "recommendations": list[float], # x_hat at each step
+            "recommendations": list[Point], # x_hat at each step
             "comparisons": list[Comparison],
         }
     """
@@ -91,7 +81,7 @@ def run_bo_loop(
 
     comparisons: list[Comparison] = []
     simple_regrets: list[float] = []
-    recommendations: list[float] = []
+    recommendations: list[Point] = []
 
     agent.reset()
 
@@ -106,8 +96,8 @@ def run_bo_loop(
         # --- suggest pair ---
         if t < n_init:
             idx1, idx2 = rng.sample(range(len(candidate_pool)), 2)
-            x1 = _candidate_value(candidate_pool[idx1])
-            x2 = _candidate_value(candidate_pool[idx2])
+            x1 = candidate_value(candidate_pool[idx1])
+            x2 = candidate_value(candidate_pool[idx2])
             phase = "init"
         else:
             x1, x2 = agent.suggest_pair(comparisons, candidate_pool)

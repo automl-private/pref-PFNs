@@ -48,15 +48,15 @@ class PBOAgent(ABC):
     Interface every agent must implement.
 
     comparisons: list of (winner_x, loser_x) observed so far
-    candidate_pool: 1-D tensor of candidate x values to choose from
+    candidate_pool: tensor of candidate point values to choose from
     """
 
     @abstractmethod
     def suggest_pair(
         self,
         comparisons: list[Comparison],
-        candidate_pool,           # torch.Tensor shape (n,)
-    ) -> tuple[float, float]:
+        candidate_pool: Tensor,
+    ) -> tuple[Point, Point]:
         """
         Return the next pair (x1, x2) to compare.
         The oracle will decide which one wins.
@@ -66,8 +66,8 @@ class PBOAgent(ABC):
     def recommend(
         self,
         comparisons: list[Comparison],
-        candidate_pool,           # torch.Tensor shape (n,)
-    ) -> float:
+        candidate_pool: Tensor,
+    ) -> Point:
         """
         Return the current best x estimate.
         """

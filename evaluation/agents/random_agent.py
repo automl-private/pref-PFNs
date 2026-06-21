@@ -13,7 +13,7 @@ from collections import Counter
 
 import torch
 
-from .base import PBOAgent, Comparison, candidate_value
+from .base import PBOAgent, Comparison, Point, candidate_value
 
 
 class RandomAgent(PBOAgent):
@@ -22,11 +22,18 @@ class RandomAgent(PBOAgent):
         self.support = support
 
     @staticmethod
+    # Функция принимает всю историю сравнений
     def _incumbent_from_history(comparisons: list[Comparison]):
-        incumbent = None
+        # (winner, loser)
+        # Пока истории нет или мы ещё её не прочитал
+        incumbent = None # лучшая текущая точка по последовательной логике дуэлей
+        # Идём по истории сравнений в хронологическом порядке
         for winner, loser in comparisons:
             if incumbent is None:
+                # Если это первое обработанное сравнение,
+                # то текущим incumbent становится победитель первого сравнения
                 incumbent = winner
+            # Если старый incumbent проиграл, заменяем его на победителя текущей дуэли
             elif loser == incumbent:
                 incumbent = winner
         return incumbent
@@ -35,7 +42,7 @@ class RandomAgent(PBOAgent):
         self,
         comparisons: list[Comparison],
         candidate_pool: torch.Tensor,
-    ) -> tuple:
+    ) -> tuple[Point, Point]:
         if self.support == "grid":
             idx1, idx2 = self._rng.sample(range(len(candidate_pool)), 2)
             return candidate_value(candidate_pool[idx1]), candidate_value(candidate_pool[idx2])
@@ -56,7 +63,7 @@ class RandomAgent(PBOAgent):
         self,
         comparisons: list[Comparison],
         candidate_pool: torch.Tensor,
-    ):
+    ) -> Point:
         if self.support == "grid":
             if not comparisons:
                 idx = self._rng.randrange(len(candidate_pool))

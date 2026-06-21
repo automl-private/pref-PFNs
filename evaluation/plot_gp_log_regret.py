@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot GP paper-style log10(simple regret) results."""
+"""Plot GP paper-style simple-regret results."""
 
 from __future__ import annotations
 
@@ -35,6 +35,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dpi", type=int, default=200)
     parser.add_argument("--title-prefix", type=str, default="GP preference BO")
     parser.add_argument("--eps", type=float, default=1e-12)
+    parser.add_argument(
+        "--metric",
+        choices=("mean_log10_regret", "log10_average_regret"),
+        default="mean_log10_regret",
+        help=(
+            "Metric to plot: mean_log10_regret plots E[log10(regret)], "
+            "log10_average_regret plots log10(E[regret])."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -65,6 +74,32 @@ def average_regret_stderr(simple_regret: torch.Tensor) -> tuple[np.ndarray, np.n
         if finite.numel() > 1:
             stderr[idx] = finite.std(unbiased=True) / math.sqrt(finite.numel())
     return mean.numpy(), stderr.numpy(), counts.numpy()
+
+
+def metric_series(
+    payload: Mapping,
+    *,
+    metric: str,
+    eps: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if metric == "mean_log10_regret":
+        y, err, counts = mean_stderr(payload["log10_regret"])
+        return y, y - err, y + err, counts
+    if metric == "log10_average_regret":
+        average_regret, err, counts = average_regret_stderr(payload["simple_regret"])
+        y = np.log10(np.maximum(average_regret, eps))
+        lower = np.log10(np.maximum(average_regret - err, eps))
+        upper = np.log10(np.maximum(average_regret + err, eps))
+        return y, lower, upper, counts
+    raise ValueError(f"Unknown plot metric {metric!r}.")
+
+
+def metric_ylabel(metric: str) -> str:
+    if metric == "mean_log10_regret":
+        return "mean log10(simple regret)"
+    if metric == "log10_average_regret":
+        return "log10(mean simple regret)"
+    raise ValueError(f"Unknown plot metric {metric!r}.")
 
 
 def display_label(method_name: str, metadata: Mapping) -> str:
@@ -125,6 +160,8 @@ def plot_suite(
     methods: Optional[Sequence[str]],
     dpi: int,
     title_prefix: str,
+    metric: str,
+    eps: float,
 ) -> None:
     fig, ax = plt.subplots(figsize=(10.5, 6.2))
 
@@ -132,7 +169,7 @@ def plot_suite(
     for method_name, payload in suite["methods"].items():
         if methods is not None and method_name not in methods:
             continue
-        y, err, counts = mean_stderr(payload["log10_regret"])
+        y, lower, upper, counts = metric_series(payload, metric=metric, eps=eps)
         x = np.arange(1, len(y) + 1)
         metadata = payload.get("metadata", {})
         linestyle = "--" if metadata.get("is_in_domain") is False else "-"
@@ -145,8 +182,8 @@ def plot_suite(
         )[0]
         ax.fill_between(
             x,
-            y - err,
-            y + err,
+            lower,
+            upper,
             color=line.get_color(),
             alpha=0.16,
             linewidth=0,
@@ -158,7 +195,7 @@ def plot_suite(
 
     ax.set_title(f"{title_prefix}\n{suite_subtitle(suite)}")
     ax.set_xlabel("# preference comparisons")
-    ax.set_ylabel("log10(simple regret)")
+    ax.set_ylabel(metric_ylabel(metric))
     ax.grid(True, alpha=0.25)
     ax.legend(fontsize=8, ncol=2)
     fig.tight_layout()
@@ -175,6 +212,8 @@ def plot_all_suites(
     methods: Optional[Sequence[str]],
     dpi: int,
     title_prefix: str,
+    metric: str,
+    eps: float,
 ) -> None:
     suites = results["suites"]
     if len(suites) <= 1:
@@ -190,7 +229,7 @@ def plot_all_suites(
         for method_name, payload in suite["methods"].items():
             if methods is not None and method_name not in methods:
                 continue
-            y, err, counts = mean_stderr(payload["log10_regret"])
+            y, lower, upper, counts = metric_series(payload, metric=metric, eps=eps)
             x = np.arange(1, len(y) + 1)
             metadata = payload.get("metadata", {})
             linestyle = "--" if metadata.get("is_in_domain") is False else "-"
@@ -203,15 +242,15 @@ def plot_all_suites(
             )[0]
             ax.fill_between(
                 x,
-                y - err,
-                y + err,
+                lower,
+                upper,
                 color=line.get_color(),
                 alpha=0.14,
                 linewidth=0,
             )
         ax.set_title(suite_subtitle(suite, compact=True))
         ax.set_xlabel("# comparisons")
-        ax.set_ylabel("log10(simple regret)")
+        ax.set_ylabel(metric_ylabel(metric))
         ax.grid(True, alpha=0.25)
         ax.legend(fontsize=7, ncol=2)
 
@@ -338,6 +377,8 @@ def main() -> None:
             methods=methods,
             dpi=args.dpi,
             title_prefix=args.title_prefix,
+            metric=args.metric,
+            eps=args.eps,
         )
         print(f"[plot] saved {out_path}")
 
@@ -348,6 +389,8 @@ def main() -> None:
         methods=methods,
         dpi=args.dpi,
         title_prefix=args.title_prefix,
+        metric=args.metric,
+        eps=args.eps,
     )
     if len(results["suites"]) > 1:
         print(f"[plot] saved {all_path}")

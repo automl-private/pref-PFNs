@@ -1,32 +1,30 @@
 #!/usr/bin/env python3
 """
-Run paper-style log10(simple regret) evaluation on 1D GP preference tasks.
+Run paper-style log10(simple regret) evaluation on GP preference tasks.
 
-For every unique GP hyperparameter set discovered in the non-vanilla PFN
-configs, this script generates GP benchmark functions with those hyperparameters
-and evaluates every baseline plus every non-vanilla PFN checkpoint.
+The GP benchmark hyperparameters come from one explicit PFN config. Baselines
+can run without loading a PFN checkpoint; the optional PFN method is always the
+single pair-score PFN agent named "pfn".
 
 The plotted quantity is:
 
     log10(max_x f(x) - f(x_hat_t))
 
 where x_hat_t is the method recommendation after t pairwise comparisons.
-Regret is computed on the fixed candidate grid using the noiseless latent GP.
+Regret is computed against the noiseless latent GP optimum/reference value.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import os
-import random
 import re
 import sys
 import tempfile
 from dataclasses import dataclass, is_dataclass, replace
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Mapping, Optional, Sequence
 
 import gpytorch
 import torch
@@ -41,740 +39,30 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from evaluation.agents import (
     FixedHyperparamQEUBOAgent,
     GPPBOAgent,
+    PairScorePFNAgent,
     QEUBOAgent,
     RandomAgent,
 )
-from evaluation.agents.base import Comparison, PBOAgent
+from evaluation.agents.base import PBOAgent
 from evaluation.benchmarks_1d import BENCHMARKS_1D, make_benchmark_1d
-from evaluation.grid_designs import make_1d_grid
-from evaluation.loop import run_bo_loop, _candidate_value
+from evaluation.loop import run_bo_loop
 from pfns.run_training_cli import load_config_from_python
+from evaluation.oracle import EvalSuiteSpec, sample_gp_function, GaussianPreferenceOracle, SampledGPFunction, GPHyperparameters
 
 
-DEFAULT_SKIP_CHECKPOINTS = ("pfn_vanilla_gp_1d_10M.pt",)
 MULTIDIM_CHECKPOINT_RE = re.compile(r"^pref_gp_(\d+)d_(.+)$")
 BASELINE_METHODS = ("random", "gp_pbo", "qeubo", "fixed_qeubo")
+PFN_METHOD = "pfn"
+VALID_METHODS = BASELINE_METHODS + (PFN_METHOD,)
 
 
 @dataclass(frozen=True)
-class GPHyperparameters:
-    lengthscale: float
-    outputscale: float
-    noise_std: float
-
-    def as_dict(self) -> Dict[str, float]:
-        return {
-            "lengthscale": float(self.lengthscale),
-            "outputscale": float(self.outputscale),
-            "noise_std": float(self.noise_std),
-        }
-
-    @property
-    def signature(self) -> str:
-        return (
-            f"lengthscale={self.lengthscale:g}_"
-            f"outputscale={self.outputscale:g}_"
-            f"noise_std={self.noise_std:g}"
-        )
-
-
-@dataclass(frozen=True)
-class CheckpointSpec:
+class PFNSpec:
     checkpoint_path: Path
     config_path: Path
-    checkpoint_name: str
-    method_name: str
-    kind: str
     train_hparams: GPHyperparameters
     prior_class: str
     input_dim: int = 1
-    config_template_name: Optional[str] = None
-
-    @property
-    def is_ranking_baseline(self) -> bool:
-        return self.kind == "compare"
-
-
-@dataclass(frozen=True)
-class EvalSuiteSpec:
-    name: str
-    functions: tuple[Union[tuple[torch.Tensor, torch.Tensor], "SampledGPFunction"], ...]
-    oracle_noise_std: float
-    baseline_hparams: GPHyperparameters
-    eval_hparams: Optional[GPHyperparameters]
-    benchmark: Optional[Dict]
-
-@dataclass(frozen=True)
-class SampledGPFunction:
-    support: str
-    input_dim: int
-    hparams: GPHyperparameters
-    seed: int
-    x_grid: Optional[torch.Tensor] = None
-    f_grid: Optional[torch.Tensor] = None
-    rff_weights: Optional[torch.Tensor] = None
-    rff_phases: Optional[torch.Tensor] = None
-    rff_coeffs: Optional[torch.Tensor] = None
-    rff_scale: float = 1.0
-    x_opt: Optional[object] = None
-    f_opt: Optional[float] = None
-
-    def evaluate(self, x, *, batch_size: int = 2048) -> torch.Tensor:
-        x = torch.as_tensor(x, dtype=torch.float32).reshape(-1, self.input_dim) # [N, input_dim]
-
-        if self.support == "grid":
-            if self.x_grid is None or self.f_grid is None:
-                raise ValueError("Grid GP function requires x_grid and f_grid.")
-            grid = self.x_grid.reshape(-1, self.input_dim)
-            # ближайший сосед
-            nearest = torch.cdist(x, grid).argmin(dim=1) # [N, len(grid)], для каждого x находит индекс ближайшей точки сетки
-            return self.f_grid[nearest]
-
-        if self.support != "continuous_rff":
-            raise ValueError(f"Unknown GP function support {self.support!r}.")
-        if self.rff_weights is None or self.rff_phases is None or self.rff_coeffs is None:
-            raise ValueError("Continuous RFF GP function is missing RFF parameters.")
-
-        values: List[torch.Tensor] = []
-        for start in range(0, x.shape[0], batch_size):
-            # Разбивает x на порции размера batch_size (кроме последней)
-            chunk = x[start : start + batch_size]
-            proj = chunk @ self.rff_weights + self.rff_phases
-            values.append(self.rff_scale * (torch.cos(proj) @ self.rff_coeffs))
-        return torch.cat(values)
-
-class GaussianPreferenceOracle:
-    """Oracle with Gaussian comparison noise for grid or continuous GP functions."""
-
-    def __init__(
-        self,
-        x_grid: Optional[torch.Tensor] = None,
-        f_grid: Optional[torch.Tensor] = None,
-        noise_std: float = 0.0,
-        seed: int = 0,
-        *,
-        gp_function: Optional[SampledGPFunction] = None,
-    ) -> None:
-        self.noise_std = float(noise_std)
-        self.seed = int(seed)
-        self._rng = torch.Generator(device="cpu")
-        self._rng.manual_seed(self.seed)
-        self.gp_function = gp_function
-
-        if gp_function is not None:
-            if x_grid is not None or f_grid is not None:
-                raise ValueError("Pass either gp_function or x_grid/f_grid, not both.")
-            if gp_function.x_opt is None or gp_function.f_opt is None:
-                raise ValueError("SampledGPFunction must contain x_opt and f_opt.")
-
-            self.support = gp_function.support
-            self.input_dim = int(gp_function.input_dim)
-            self.x_grid = gp_function.x_grid
-            self.f_grid = gp_function.f_grid
-            self._x_opt = gp_function.x_opt
-            self._f_opt = float(gp_function.f_opt)
-            return
-
-        if x_grid is None or f_grid is None:
-            raise ValueError("Grid oracle requires x_grid and f_grid.")
-
-        self.support = "grid"
-        self.x_grid = x_grid.detach().cpu().float()
-        self.f_grid = f_grid.detach().cpu().float()
-        self.input_dim = 1 if self.x_grid.ndim == 1 else int(self.x_grid.shape[1])
-
-        if self.x_grid.shape[0] != self.f_grid.shape[0]:
-            raise ValueError("x_grid and f_grid must have the same first dimension.")
-
-        best_idx = int(self.f_grid.argmax().item())
-        self._x_opt = self._format_point(self.x_grid[best_idx])
-        self._f_opt = float(self.f_grid[best_idx].item())
-
-    @property
-    def f_opt(self) -> float:
-        return self._f_opt
-
-    @property
-    def x_opt(self):
-        return self._x_opt
-    
-    def _point_tensor(self, x) -> torch.Tensor:
-        point = torch.as_tensor(x, dtype=torch.float32).reshape(-1)
-        if point.numel() != self.input_dim:
-            raise ValueError(f"Expected {self.input_dim}D point, got shape {tuple(point.shape)}.")
-        return point
-
-    def _nearest_idx(self, x) -> int:
-        if self.support != "grid":
-            raise RuntimeError("_nearest_idx is only valid for grid support.")
-        point = self._point_tensor(x)
-        if self.input_dim == 1 and self.x_grid.ndim == 1:
-            return int((self.x_grid - point[0]).abs().argmin().item())
-
-        grid = self.x_grid.reshape(-1, self.input_dim)
-        distances = torch.linalg.norm(grid - point, dim=-1)
-        return int(distances.argmin().item())
-    
-    def _format_point(self, x: torch.Tensor):
-        point = torch.as_tensor(x, dtype=torch.float32).reshape(-1)
-        if self.input_dim == 1:
-            return float(point[0].item())
-        return tuple(float(v) for v in point.tolist())
-
-    def f_at(self, x) -> float:
-        point = self._point_tensor(x)
-
-        if self.gp_function is not None:
-            value = self.gp_function.evaluate(point.reshape(1, self.input_dim))
-            return float(value.reshape(-1)[0].item())
-
-        idx = self._nearest_idx(point)
-        return float(self.f_grid[idx].item())
-
-    def compare(self, x1, x2):
-        f1 = self.f_at(x1)
-        f2 = self.f_at(x2)
-
-        if self.noise_std > 0:
-            f1 = f1 + self.noise_std * torch.randn((), generator=self._rng).item()
-            f2 = f2 + self.noise_std * torch.randn((), generator=self._rng).item()
-
-        if f1 >= f2:
-            return self._format_point(self._point_tensor(x1)), self._format_point(self._point_tensor(x2))
-        return self._format_point(self._point_tensor(x2)), self._format_point(self._point_tensor(x1))
-
-    def simple_regret(self, x_recommended) -> float:
-        return max(self.f_opt - self.f_at(x_recommended), 0.0)
-
-
-def sample_gp_function(
-    *,
-    n_grid: int,
-    input_dim: int = 1,
-    hparams: GPHyperparameters,
-    seed: int,
-    grid_design: str = "uniform",
-    grid_seed: int = 0,
-    jitter: float = 1e-6,
-    support: str = "grid",
-    rff_num_features: int = 4096,
-    opt_reference_size: int = 65536,
-    opt_reference_seed: Optional[int] = None,
-    rff_eval_batch_size: int = 2048,
-) -> Union[Tuple[torch.Tensor, torch.Tensor], SampledGPFunction]:
-    """Sample a noiseless latent GP benchmark.
-
-    support="grid" preserves the old exact finite-grid GP sample.
-    support="continuous_rff" returns an approximate continuous RBF GP path.
-    """
-    if input_dim < 1:
-        raise ValueError(f"input_dim must be positive, got {input_dim}")
-    if support == "grid":
-        if input_dim == 1:
-            x_eval = make_1d_grid(n_grid, design=grid_design, seed=grid_seed, dtype=torch.double)
-            x_kernel = x_eval.unsqueeze(-1)
-        else:
-            generator = torch.Generator(device="cpu")
-            generator.manual_seed(int(grid_seed))
-            if grid_design == "lhs":
-                base = torch.arange(n_grid, dtype=torch.double).unsqueeze(-1)
-                offsets = torch.rand(n_grid, input_dim, generator=generator, dtype=torch.double)
-                x_kernel = (base + offsets) / float(n_grid)
-                for dim in range(input_dim):
-                    perm = torch.randperm(n_grid, generator=generator)
-                    x_kernel[:, dim] = x_kernel[perm, dim]
-            else:
-                x_kernel = torch.rand(n_grid, input_dim, generator=generator, dtype=torch.double)
-            x_eval = x_kernel
-
-        base_kernel = gpytorch.kernels.RBFKernel(ard_num_dims=input_dim)
-        base_kernel.lengthscale = hparams.lengthscale
-        covar_module = gpytorch.kernels.ScaleKernel(base_kernel)
-        covar_module.outputscale = hparams.outputscale
-
-        mean = torch.zeros(n_grid, dtype=torch.double)
-        covar = covar_module(x_kernel).add_jitter(jitter)
-        cov = covar.to_dense() if hasattr(covar, "to_dense") else covar.evaluate()
-        dist = torch.distributions.MultivariateNormal(mean, cov)
-
-        old_state = torch.random.get_rng_state()
-        torch.manual_seed(seed)
-        try:
-            with torch.no_grad():
-                f = dist.sample()
-        finally:
-            torch.random.set_rng_state(old_state)
-
-        return x_eval.float(), f.float()
-    
-    if support != "continuous_rff":
-        raise ValueError(f"Unknown GP function support {support!r}.")
-
-    if rff_num_features < 1:
-        # количество базисных функций
-        raise ValueError("rff_num_features must be positive.")
-    if opt_reference_size < 1:
-        # размер опорной выборки для поиска оптимума
-        raise ValueError("opt_reference_size must be positive.")
-
-    path_rng = torch.Generator(device="cpu")
-    path_rng.manual_seed(int(seed))
-
-    # Для RBF-ядра спектральная плотность – гауссовская
-    # Генерируем матрицу [input_dim, rff_num_features], каждый элемент ~ N(0,1), затем делим на длину масштаба lengthscale
-    # спектральная плотность RBF – тоже гауссовская с обратной ковариацией
-    # Спектральная плотность RBF — это преобразование Фурье экспоненциально-квадратичной ковариационной функции.
-    rff_weights = (
-        torch.randn(input_dim, rff_num_features, generator=path_rng)
-        / float(hparams.lengthscale)
-    ) # [input_dim, rff_num_features]
-    # Генерируем случайные сдвиги равномерно на [0,2π].
-    rff_phases = 2.0 * math.pi * torch.rand(rff_num_features, generator=path_rng) # [rff_num_features]
-    # независимая стандартная нормальная случайная величина
-    rff_coeffs = torch.randn(rff_num_features, generator=path_rng)
-    # sqrt(2 / GP variance)
-    rff_scale = math.sqrt(2.0 * float(hparams.outputscale) / float(rff_num_features))
-
-    # x_grid, f_grid остаются None
-    sampled = SampledGPFunction(
-        support="continuous_rff",
-        input_dim=input_dim,
-        hparams=hparams,
-        seed=int(seed),
-        rff_weights=rff_weights.float(),
-        rff_phases=rff_phases.float(),
-        rff_coeffs=rff_coeffs.float(),
-        rff_scale=rff_scale,
-    )
-
-    if opt_reference_seed is None:
-        opt_reference_seed = int(seed) + 1_000_003
-
-    # последовательность Соболя для 
-    sobol = torch.quasirandom.SobolEngine(
-        dimension=input_dim,
-        scramble=True,
-        seed=int(opt_reference_seed),
-    )
-    x_reference = sobol.draw(int(opt_reference_size)).float()
-    # Вычисление значений GP на этих точках
-    f_reference = sampled.evaluate(x_reference, batch_size=rff_eval_batch_size)
-
-    # Поиск точки с максимальным значением
-    best_idx = int(f_reference.argmax().item())
-    best_x = x_reference[best_idx]
-    # Для одномерного случая возвращается число с плавающей точкой; для многомерного – кортеж чисел
-    x_opt = (
-        float(best_x[0].item())
-        if input_dim == 1
-        else tuple(float(v) for v in best_x.tolist())
-    )
-
-    return replace(
-        sampled,
-        x_opt=x_opt,
-        f_opt=float(f_reference[best_idx].item()),
-    )
-
-
-def _build_pref_context(
-    comparisons: list[Comparison],
-    *,
-    dtype: torch.dtype,
-    device: torch.device,
-    input_dims: int = 2,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if not comparisons:
-        x_ctx = torch.zeros(1, 0, input_dims, dtype=dtype, device=device)
-        y_ctx = torch.zeros(1, 0, dtype=dtype, device=device)
-        return x_ctx, y_ctx
-
-    pairs = torch.as_tensor(comparisons, dtype=dtype, device=device)
-    if pairs.ndim == 3:
-        pairs = pairs.reshape(pairs.shape[0], -1)
-    x_ctx = pairs.unsqueeze(0)
-    y_ctx = torch.zeros(1, len(comparisons), dtype=dtype, device=device)
-    return x_ctx, y_ctx
-
-
-def _safe_random_challenger(
-    candidate_pool: torch.Tensor,
-    chosen: float,
-) -> float:
-    pool = candidate_pool.tolist()
-    if len(pool) <= 1:
-        return chosen
-    for _ in range(20):
-        challenger = pool[torch.randint(len(pool), (1,)).item()]
-        if challenger != chosen:
-            return challenger
-    return pool[0] if pool[0] != chosen else pool[-1]
-
-# TODO: make fixes for multidim
-class UtilityPFNAgent(PBOAgent):
-    """PFN agent for utility or negative-regret scalar predictions."""
-
-    def __init__(
-        self,
-        model,
-        *,
-        device: str,
-        n_ts_samples: int,
-    ) -> None:
-        self.model = model
-        self.model.eval()
-        self.device = torch.device(device)
-        self.criterion = model.criterion
-        self.n_ts_samples = int(n_ts_samples)
-
-    @property
-    def dtype(self) -> torch.dtype:
-        return next(self.model.parameters()).dtype
-
-    def _logits(
-        self,
-        comparisons: list[Comparison],
-        candidate_pool: torch.Tensor,
-    ) -> torch.Tensor:
-        x_ctx, y_ctx = _build_pref_context(
-            comparisons,
-            dtype=self.dtype,
-            device=self.device,
-        )
-        x_query = candidate_pool.to(dtype=self.dtype, device=self.device)
-        test_x = torch.zeros(1, x_query.numel(), 2, dtype=self.dtype, device=self.device)
-        test_x[0, :, 0] = x_query
-        with torch.no_grad():
-            logits = self.model(x_ctx, y_ctx, test_x=test_x)
-        return logits[0] # (M, num_bins)
-
-    def _score(self, comparisons: list[Comparison], candidate_pool: torch.Tensor) -> torch.Tensor:
-        logits = self._logits(comparisons, candidate_pool)
-        return self.criterion.mean(logits).detach().cpu()
-
-    def _sample_score(
-        self,
-        comparisons: list[Comparison],
-        candidate_pool: torch.Tensor,
-    ) -> torch.Tensor:
-        logits = self._logits(comparisons, candidate_pool) # (M, B)
-        return self.criterion.sample(logits).detach().cpu() # (M,) один sampled scalar score на каждую candidate point
-
-    def suggest_pair(
-        self,
-        comparisons: list[Comparison],
-        candidate_pool: torch.Tensor,
-    ) -> tuple[float, float]:
-        if not comparisons:
-            idx = torch.randperm(len(candidate_pool))[:2]
-            return candidate_pool[idx[0]].item(), candidate_pool[idx[1]].item()
-
-        argmaxes: List[float] = []
-        for _ in range(max(1, self.n_ts_samples)): # n_ts_samples = 2
-            # 1. sample one possible score function over grid
-            # 2. take its argmax
-            # 3. sample another possible score function over grid
-            # 4. take its argmax
-            # 5. use these two argmaxes as comparison pair
-            scores = self._sample_score(comparisons, candidate_pool)
-            argmaxes.append(candidate_pool[scores.argmax()].item()) # [a, b]
-
-        if len(set(argmaxes)) == 1:
-            return argmaxes[0], _safe_random_challenger(candidate_pool, argmaxes[0])
-        return argmaxes[0], argmaxes[1]
-
-    def recommend(
-        self,
-        comparisons: list[Comparison],
-        candidate_pool: torch.Tensor,
-    ) -> float:
-        if not comparisons:
-            return candidate_pool[candidate_pool.shape[0] // 2].item()
-        scores = self._score(comparisons, candidate_pool)
-        return candidate_pool[scores.argmax()].item()
-
-
-class PairScorePFNAgent(PBOAgent):
-    """
-    PFN-агент для checkpoint'ов, которые напрямую скорят пару точек.
-
-    В `support="grid"` сохраняет старое поведение: считает полную матрицу
-    pair-score'ов на переданном `candidate_pool`. В `support="continuous_rff"`
-    работает как batched candidate-set optimizer: сначала скорит диагональ
-    `(x, x)` на большом continuous pool, затем rerank'ит полный набор пар только
-    на shortlist из top-k и exploration-точек.
-    """
-
-    def __init__(
-        self,
-        model,
-        *,
-        device: str,
-        pair_batch_size: int,
-        input_dim: int,
-        support: str = "grid",
-        continuous_top_k: int = 64,
-        continuous_explore_k: int = 64,
-    ) -> None:
-        """
-        Инициализирует pair-score PFN и параметры continuous shortlist-поиска.
-
-        Args:
-            model: Обученная PFN-модель с `criterion`.
-            device: Устройство для forward pass'ов PFN.
-            pair_batch_size: Сколько пар отправлять в PFN за один batch.
-            input_dim: Размерность одной точки; вход пары имеет размер
-                `2 * input_dim`.
-            support: `"grid"` для старого полного перебора или
-                `"continuous_rff"` для shortlist/reranking по continuous pool.
-            continuous_top_k: Сколько лучших точек по диагональному score
-                брать в shortlist.
-            continuous_explore_k: Сколько случайных exploration-точек добавлять
-                в shortlist.
-        """
-        self.model = model
-        self.model.eval()
-        self.device = torch.device(device)
-        self.criterion = model.criterion
-        self.pair_batch_size = int(pair_batch_size)
-        self.input_dim = int(input_dim)
-        self.support = support
-        self.continuous_top_k = int(continuous_top_k)
-        self.continuous_explore_k = int(continuous_explore_k)
-
-    @property
-    def dtype(self) -> torch.dtype:
-        return next(self.model.parameters()).dtype
-
-    def _candidate_matrix(self, candidate_pool: torch.Tensor) -> torch.Tensor:
-        """
-        Приводит candidate pool к матрице shape `(M, input_dim)`.
-
-        Для одномерного pool shape `(M,)` добавляет последнюю размерность, а для
-        многомерного pool сохраняет первую размерность как число кандидатов.
-        """
-        x = candidate_pool.to(dtype=self.dtype, device=self.device)
-        if x.ndim == 1:
-            return x.unsqueeze(-1)
-        return x.reshape(x.shape[0], -1)
-
-    def _score_pair_tensor(
-        self,
-        comparisons: list[Comparison],
-        pairs: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Скорит произвольный список пар через PFN.
-
-        Args:
-            comparisons: История наблюденных сравнений `(winner, loser)`.
-            pairs: Tensor shape `(N, 2 * input_dim)`, где каждая строка это
-                конкатенация `[x_1, x_2]`.
-
-        Returns:
-            Tensor shape `(N,)` с mean score из PFN criterion для каждой пары.
-        """
-        pairs = pairs.to(dtype=self.dtype, device=self.device)
-        expected_dim = self.input_dim * 2
-        if pairs.ndim != 2 or pairs.shape[-1] != expected_dim:
-            raise ValueError(
-                f"Expected pairs with shape (N, {expected_dim}), got {tuple(pairs.shape)}."
-            )
-
-        x_ctx, y_ctx = _build_pref_context(
-            comparisons,
-            dtype=self.dtype,
-            device=self.device,
-            input_dims=expected_dim,
-        )
-
-        batch_size = pairs.shape[0] if self.pair_batch_size <= 0 else self.pair_batch_size
-        chunks: List[torch.Tensor] = []
-        with torch.no_grad():
-            for start in range(0, pairs.shape[0], batch_size):
-                test_x = pairs[start : start + batch_size].unsqueeze(0)
-                logits = self.model(x_ctx, y_ctx, test_x=test_x)
-                chunks.append(self.criterion.mean(logits)[0].detach().cpu())
-        return torch.cat(chunks)
-
-    def _diag_scores(
-        self,
-        comparisons: list[Comparison],
-        candidate_pool: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Считает score для диагональных пар `(x, x)` по всем кандидатам.
-
-        В continuous режиме это дешевый proxy для качества одиночной точки:
-        `recommend` берет argmax этих score'ов, а `suggest_pair` использует их
-        для отбора shortlist перед полным pairwise reranking.
-        """
-        x = self._candidate_matrix(candidate_pool)
-        pairs = torch.cat([x, x], dim=-1)
-        return self._score_pair_tensor(comparisons, pairs)
-
-    def _pair_scores(
-        self,
-        comparisons: list[Comparison],
-        candidate_pool: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Строит и скорит полную матрицу пар из одного candidate pool.
-
-        Возвращает `scores` shape `(M, M)`, где `scores[i, j]` соответствует
-        PFN-score пары `(candidate_pool[i], candidate_pool[j])`.
-        """
-        x = self._candidate_matrix(candidate_pool)
-        M = x.shape[0]
-        x1 = x.repeat_interleave(M, dim=0)
-        x2 = x.repeat(M, 1)
-        pairs = torch.cat([x1, x2], dim=-1)
-        # 1D x (4,)      x1 (4, 4)   x2 (4, 4)   pairs (16, 2)
-        # 2D x (4, 2)   x1 (16, 2)  x2 (16, 2)  pairs (16, 4)
-        return self._score_pair_tensor(comparisons, pairs).reshape(M, M)
-
-    def _continuous_shortlist(
-        self,
-        comparisons: list[Comparison],
-        candidate_pool: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Формирует shortlist для continuous pair-search.
-
-        Сначала берет `continuous_top_k` лучших точек по диагональному score
-        `(x, x)`, затем добавляет `continuous_explore_k` случайных точек из
-        исходного pool и удаляет дубликаты. Это снижает стоимость pair search
-        с полного `M x M` до `K x K`.
-        """
-        M = len(candidate_pool)
-        diag_scores = self._diag_scores(comparisons, candidate_pool)
-        top_k = min(M, max(1, self.continuous_top_k))
-        explore_k = min(M, max(0, self.continuous_explore_k))
-
-        selected = [int(i) for i in torch.topk(diag_scores, k=top_k).indices.tolist()]
-        if explore_k > 0:
-            selected.extend(int(i) for i in torch.randperm(M)[:explore_k].tolist())
-
-        unique_indices: List[int] = []
-        seen = set()
-        for idx in selected:
-            if idx not in seen:
-                unique_indices.append(idx)
-                seen.add(idx)
-
-        if len(unique_indices) < min(2, M):
-            for idx in torch.randperm(M).tolist():
-                idx = int(idx)
-                if idx not in seen:
-                    unique_indices.append(idx)
-                    seen.add(idx)
-                if len(unique_indices) >= min(2, M):
-                    break
-
-        shortlist_idx = torch.tensor(unique_indices, dtype=torch.long)
-        return candidate_pool[shortlist_idx]
-
-    def suggest_pair(
-        self,
-        comparisons: list[Comparison],
-        candidate_pool: torch.Tensor,
-    ) -> tuple[float, float]:
-        """
-        Выбирает следующую пару для oracle comparison.
-
-        В grid режиме делает старый полный argmax по матрице pair-score'ов на
-        `candidate_pool`. В continuous режиме сначала строит shortlist, затем
-        скорит все пары внутри него и возвращает лучшую недиагональную пару.
-        """
-        if not comparisons:
-            idx = torch.randperm(len(candidate_pool))[:2]
-            return _candidate_value(candidate_pool[idx[0]]), _candidate_value(candidate_pool[idx[1]])
-
-        if self.support == "grid":
-            scores = self._pair_scores(comparisons, candidate_pool)
-            pool = candidate_pool
-        elif self.support == "continuous_rff":
-            pool = self._continuous_shortlist(comparisons, candidate_pool)
-            scores = self._pair_scores(comparisons, pool)
-        else:
-            raise ValueError(f"Unknown PairScorePFNAgent support {self.support!r}.")
-
-        # scores[i, j] ≈ E[max(f(x_i), f(x_j)) | comparisons]
-        # scores[i, j] ≈ E[max(f(x_i), f(x_j)) - f* | comparisons]
-        idx = torch.arange(scores.shape[0])
-        scores[idx, idx] = -torch.inf
-        # Диагональ зануляется 
-        flat_idx = int(torch.argmax(scores).item())
-        # Потом flat index переводится в пару индексов
-        i = int(flat_idx // scores.shape[1])
-        j = int(flat_idx % scores.shape[1])
-        # argmax_{i != j} scores[i, j]
-        return _candidate_value(pool[i]), _candidate_value(pool[j])
-
-    def recommend(
-        self,
-        comparisons: list[Comparison],
-        candidate_pool: torch.Tensor,
-    ) -> float:
-        """
-        Возвращает текущую рекомендацию лучшей точки.
-
-        В grid режиме сохраняет старую логику: берет диагональ полной pair-score
-        матрицы. В continuous режиме не строит `M x M`; скорит только диагональ
-        `(x, x)` на большом `candidate_pool` и возвращает argmax.
-        """
-        if not comparisons:
-            return _candidate_value(candidate_pool[candidate_pool.shape[0] // 2])
-        if self.support == "grid":
-            scores = self._pair_scores(comparisons, candidate_pool)
-            diag = torch.diagonal(scores)
-            return _candidate_value(candidate_pool[diag.argmax()])
-
-        if self.support == "continuous_rff":
-            diag = self._diag_scores(comparisons, candidate_pool)
-            return _candidate_value(candidate_pool[diag.argmax()])
-
-        raise ValueError(f"Unknown PairScorePFNAgent support {self.support!r}.")
-
-
-# TODO: make fixes for multidim
-class CompareCopelandPFNAgent(PairScorePFNAgent):
-    """Ranking-only PFN baseline for compare checkpoints."""
-
-    def suggest_pair(
-        self,
-        comparisons: list[Comparison],
-        candidate_pool: torch.Tensor,
-    ) -> tuple[float, float]:
-        if not comparisons:
-            idx = torch.randperm(len(candidate_pool))[:2]
-            return candidate_pool[idx[0]].item(), candidate_pool[idx[1]].item()
-        scores = self._copeland_scores(comparisons, candidate_pool)
-        top2 = torch.topk(scores, k=2).indices
-        return candidate_pool[top2[0]].item(), candidate_pool[top2[1]].item()
-
-    def recommend(
-        self,
-        comparisons: list[Comparison],
-        candidate_pool: torch.Tensor,
-    ) -> float:
-        if not comparisons:
-            return candidate_pool[candidate_pool.shape[0] // 2].item()
-        scores = self._copeland_scores(comparisons, candidate_pool)
-        return candidate_pool[scores.argmax()].item()
-
-    def _copeland_scores(
-        self,
-        comparisons: list[Comparison],
-        candidate_pool: torch.Tensor,
-    ) -> torch.Tensor:
-        # pair_scores[i, j] is model E[target] for pair [x_i, x_j].
-        # In compare training target=1 iff the second candidate is better.
-        pair_scores = self._pair_scores(comparisons, candidate_pool).clamp(0.0, 1.0)
-        M = pair_scores.shape[0]
-        mask = ~torch.eye(M, dtype=torch.bool)
-        column_scores = pair_scores.masked_fill(~mask, float("nan")).nanmean(dim=0)
-        return column_scores.nan_to_num(0.0)
 
 
 def atomic_torch_save(obj, path: Path) -> None:
@@ -788,12 +76,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Evaluate PFN checkpoints and baselines on GP log-regret suites."
     )
-    parser.add_argument(
-        "--checkpoint-dirs",
-        nargs="+",
-        default=["checkpoints", "checkpoints2", "checkpoints3", "checkpoints4"],
-    )
-    parser.add_argument("--config-dirs", nargs="+", default=["my_configs", "my_configs2", "my_configs3"])
+    parser.add_argument("--pfn-checkpoint", type=Path, default=None)
+    parser.add_argument("--pfn-config", type=Path, default=None)
+    parser.add_argument("--input-dim", type=int, default=1)
     parser.add_argument("--out", type=Path, default=Path("results/gp_log_regret/results.pt"))
     parser.add_argument("--budget", type=int, default=60)
     parser.add_argument("--n-init", type=int, default=5)
@@ -820,7 +105,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gp-rff-eval-batch-size", type=int, default=2048)
     parser.add_argument("--eps", type=float, default=1e-12)
     parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument("--pfn-ts-samples", type=int, default=2)
     parser.add_argument("--pfn-pair-batch-size", type=int, default=4096)
     parser.add_argument("--qeubo-num-acqf-samples", type=int, default=512)
     parser.add_argument("--qeubo-max-fit-iter", type=int, default=100)
@@ -862,69 +146,20 @@ def parse_args() -> argparse.Namespace:
         "--methods",
         nargs="+",
         default=["all"],
-        help="Method names to run, or 'all'. Baselines: random gp_pbo qeubo fixed_qeubo.",
+        help="Method names to run, or 'all'. Valid methods: random gp_pbo qeubo fixed_qeubo pfn.",
     )
     parser.add_argument("--exclude-methods", nargs="*", default=[])
-    parser.add_argument("--only-checkpoints", nargs="*", default=[])
-    parser.add_argument("--skip-checkpoints", nargs="*", default=list(DEFAULT_SKIP_CHECKPOINTS))
     parser.add_argument("--save-every-method", action="store_true", default=True)
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
 
 
-def find_config_paths(config_dirs: Sequence[str]) -> Dict[str, Path]:
-    out: Dict[str, Path] = {}
-    for config_dir in config_dirs:
-        root = Path(config_dir)
-        if not root.is_dir():
-            continue
-        for path in sorted(root.glob("train_*.py")):
-            name = path.stem.removeprefix("train_")
-            out[name] = path
-    return out
-
-
-def infer_checkpoint_input_dim(name: str) -> int:
+def infer_checkpoint_input_dim(name: str) -> Optional[int]:
+    name = Path(str(name)).stem.removeprefix("pfn_")
     match = MULTIDIM_CHECKPOINT_RE.match(name)
     if match is None:
-        return 1
+        return None
     return int(match.group(1))
-
-
-def resolve_config_path_for_checkpoint(
-    name: str,
-    config_paths: Mapping[str, Path],
-) -> tuple[Optional[Path], Optional[str]]:
-    if name in config_paths:
-        return config_paths[name], None
-
-    match = MULTIDIM_CHECKPOINT_RE.match(name)
-    if match is None:
-        return None, None
-
-    dim = int(match.group(1))
-    suffix = match.group(2)
-    if dim == 1:
-        return None, None
-
-    template_name = f"pref_gp_1d_{suffix}"
-    if template_name in config_paths:
-        return config_paths[template_name], template_name
-    return None, template_name
-
-
-def classify_checkpoint(name: str) -> str:
-    if "vanilla" in name:
-        return "vanilla"
-    if "compare" in name:
-        return "compare"
-    if "qeubo_regret" in name:
-        return "qeubo_regret"
-    if "qeubo" in name:
-        return "qeubo"
-    if "regret" in name:
-        return "regret"
-    return "utility"
 
 
 def load_hparams_from_config(config_path: Path) -> tuple[GPHyperparameters, str]:
@@ -938,57 +173,64 @@ def load_hparams_from_config(config_path: Path) -> tuple[GPHyperparameters, str]
     return hparams, type(prior).__name__
 
 
-def discover_checkpoints(args: argparse.Namespace) -> tuple[List[CheckpointSpec], Dict[str, str]]:
-    config_paths = find_config_paths(args.config_dirs)
-    only = set(args.only_checkpoints)
-    skip = set(args.skip_checkpoints)
-    skipped: Dict[str, str] = {}
-    specs: List[CheckpointSpec] = []
-
-    for checkpoint_dir in args.checkpoint_dirs:
-        root = Path(checkpoint_dir)
-        if not root.is_dir():
-            continue
-        for checkpoint_path in sorted(root.glob("pfn_*.pt")):
-            checkpoint_name = checkpoint_path.name
-            name = checkpoint_path.stem.removeprefix("pfn_")
-            if only and checkpoint_name not in only and name not in only:
-                continue
-            if checkpoint_name in skip or name in skip:
-                skipped[checkpoint_name] = "listed in skip checkpoints"
-                continue
-            kind = classify_checkpoint(name)
-            if kind == "vanilla":
-                skipped[checkpoint_name] = "vanilla GP checkpoint requires direct utility observations"
-                continue
-            config_path, config_template_name = resolve_config_path_for_checkpoint(name, config_paths)
-            if config_path is None:
-                if config_template_name is None:
-                    skipped[checkpoint_name] = f"missing config train_{name}.py"
-                else:
-                    skipped[checkpoint_name] = (
-                        f"missing config train_{name}.py and template "
-                        f"train_{config_template_name}.py"
-                    )
-                continue
-
-            hparams, prior_class = load_hparams_from_config(config_path)
-            method_name = f"{name}_copeland" if kind == "compare" else name
-            specs.append(
-                CheckpointSpec(
-                    checkpoint_path=checkpoint_path,
-                    config_path=config_path,
-                    checkpoint_name=checkpoint_name,
-                    method_name=method_name,
-                    kind=kind,
-                    train_hparams=hparams,
-                    prior_class=prior_class,
-                    input_dim=infer_checkpoint_input_dim(name),
-                    config_template_name=config_template_name,
-                )
+def requested_methods(args: argparse.Namespace) -> List[str]:
+    if args.methods == ["all"]:
+        selected = list(BASELINE_METHODS)
+        if args.pfn_checkpoint is not None:
+            selected.append(PFN_METHOD)
+    else:
+        requested = list(args.methods)
+        unknown = sorted(set(requested) - set(VALID_METHODS))
+        if unknown:
+            raise ValueError(
+                "Unknown methods "
+                f"{unknown}. Valid methods are: {', '.join(VALID_METHODS)}."
             )
+        selected = [name for name in VALID_METHODS if name in set(requested)]
 
-    return specs, skipped
+    excluded = set(args.exclude_methods)
+    unknown_excluded = sorted(excluded - set(VALID_METHODS))
+    if unknown_excluded:
+        raise ValueError(
+            "Unknown excluded methods "
+            f"{unknown_excluded}. Valid methods are: {', '.join(VALID_METHODS)}."
+        )
+    return [name for name in selected if name not in excluded]
+
+
+def validate_pfn_args(args: argparse.Namespace, selected_methods: Sequence[str]) -> None:
+    if args.input_dim < 1:
+        raise ValueError(f"--input-dim must be positive, got {args.input_dim}.")
+    if args.pfn_config is None:
+        raise ValueError("--pfn-config is required; it defines the GP eval hyperparameters.")
+    if PFN_METHOD in selected_methods and args.pfn_checkpoint is None:
+        raise ValueError("--pfn-checkpoint is required when --methods includes pfn.")
+    if args.pfn_checkpoint is None:
+        return
+
+    checkpoint_dim = infer_checkpoint_input_dim(args.pfn_checkpoint)
+    if checkpoint_dim is not None and checkpoint_dim != int(args.input_dim):
+        raise ValueError(
+            f"Checkpoint name implies input_dim={checkpoint_dim}, "
+            f"but --input-dim={args.input_dim}."
+        )
+
+
+def make_pfn_spec(
+    args: argparse.Namespace,
+    *,
+    hparams: GPHyperparameters,
+    prior_class: str,
+) -> Optional[PFNSpec]:
+    if args.pfn_checkpoint is None:
+        return None
+    return PFNSpec(
+        checkpoint_path=args.pfn_checkpoint,
+        config_path=args.pfn_config,
+        train_hparams=hparams,
+        prior_class=prior_class,
+        input_dim=int(args.input_dim),
+    )
 
 
 def _replace_config_obj(obj, **updates):
@@ -1002,7 +244,7 @@ def _replace_config_obj(obj, **updates):
     return obj
 
 
-def apply_checkpoint_shape_overrides(config, spec: CheckpointSpec):
+def apply_checkpoint_shape_overrides(config, spec: PFNSpec):
     if spec.input_dim <= 1:
         return config
     num_features = 2 * spec.input_dim
@@ -1019,7 +261,7 @@ def apply_checkpoint_shape_overrides(config, spec: CheckpointSpec):
     return config
 
 
-def load_pfn_model(spec: CheckpointSpec, device: str):
+def load_pfn_model(spec: PFNSpec, device: str):
     config = load_config_from_python(str(spec.config_path), 0)
     config = apply_checkpoint_shape_overrides(config, spec)
     model = config.model.create_model().to(device)
@@ -1032,125 +274,68 @@ def load_pfn_model(spec: CheckpointSpec, device: str):
     return model
 
 
-def requested_methods(args: argparse.Namespace, checkpoint_specs: Sequence[CheckpointSpec]) -> List[str]:
-    pfn_names = [spec.method_name for spec in checkpoint_specs]
-    all_names = list(BASELINE_METHODS) + pfn_names
-    if args.methods == ["all"]:
-        selected = list(BASELINE_METHODS) + [
-            spec.method_name for spec in checkpoint_specs if spec.input_dim == 1
-        ]
-    else:
-        requested = set(args.methods)
-        selected = [name for name in all_names if name in requested]
-    excluded = set(args.exclude_methods)
-    return [name for name in selected if name not in excluded]
-
-
-def make_pfn_agent_factory(
-    spec: CheckpointSpec,
-    model,
-    args: argparse.Namespace,
-) -> Callable[[], PBOAgent]:
-    """
-    Создает factory для PFN-агента соответствующего checkpoint'а.
-
-    Для pair-score PFN передает `args.gp_support`, чтобы qEUBO/qEUBO-regret
-    checkpoint'и автоматически использовали grid или continuous ветку агента
-    в зависимости от support текущего GP benchmark.
-    """
-    if spec.kind in {"qeubo", "qeubo_regret"}:
-        return lambda: PairScorePFNAgent(
-            model,
-            device=args.device,
-            pair_batch_size=args.pfn_pair_batch_size,
-            input_dim=spec.input_dim,
-            support=args.gp_support,
-        )
-    if spec.kind == "compare":
-        return lambda: CompareCopelandPFNAgent(
-            model,
-            device=args.device,
-            pair_batch_size=args.pfn_pair_batch_size,
-            input_dim=spec.input_dim,
-        )
-    return lambda: UtilityPFNAgent(
-        model,
-        device=args.device,
-        n_ts_samples=args.pfn_ts_samples,
-    )
-
-
 def build_eval_suite_specs(
     args: argparse.Namespace,
     eval_hparams: Sequence[GPHyperparameters],
 ) -> List[EvalSuiteSpec]:
     suites: List[EvalSuiteSpec] = []
-
-    input_dims = set()
-    for value in list(getattr(args, "methods", [])) + list(getattr(args, "only_checkpoints", [])):
-        name = Path(str(value)).stem.removeprefix("pfn_")
-        match = MULTIDIM_CHECKPOINT_RE.match(name)
-        if match is not None:
-            input_dims.add(int(match.group(1)))
-    if not input_dims:
-        input_dims.add(1)
+    input_dim = int(args.input_dim)
 
     if args.benchmark_mode in {"gp_only", "all"}:
         for hparams in eval_hparams:
-            for input_dim in sorted(input_dims):
-                gp_functions = []
-                for gp_idx in range(args.n_gp_functions):
-                    opt_reference_seed = None
-                    if args.gp_opt_reference_seed_offset is not None:
-                        opt_reference_seed = args.gp_opt_reference_seed_offset + gp_idx
+            gp_functions = []
+            for gp_idx in range(args.n_gp_functions):
+                opt_reference_seed = None
+                if args.gp_opt_reference_seed_offset is not None:
+                    opt_reference_seed = args.gp_opt_reference_seed_offset + gp_idx
 
-                    gp_functions.append(
-                        sample_gp_function(
-                            n_grid=args.n_grid,
-                            input_dim=input_dim,
-                            hparams=hparams,
-                            seed=args.gp_seed_offset + gp_idx,
-                            grid_design=args.grid_design,
-                            grid_seed=args.grid_seed_offset + gp_idx,
-                            jitter=args.gp_jitter,
-                            support=args.gp_support,
-                            rff_num_features=args.gp_rff_num_features,
-                            opt_reference_size=args.gp_opt_reference_size,
-                            opt_reference_seed=opt_reference_seed,
-                            rff_eval_batch_size=args.gp_rff_eval_batch_size,
-                        )
-                    )
-                gp_functions = tuple(gp_functions)
-                suite_name = hparams.signature if input_dim == 1 else f"{hparams.signature}_d{input_dim}"
-                benchmark = None
-                if input_dim != 1 or args.gp_support != "grid":
-                    benchmark = {
-                        "kind": "gp",
-                        "input_dim": int(input_dim),
-                        "support": args.gp_support,
-                        "grid_design": args.grid_design,
-                        "grid_seed_offset": int(args.grid_seed_offset),
-                        "gp_seed_offset": int(args.gp_seed_offset),
-                    }
-                    if args.gp_support == "continuous_rff":
-                        benchmark.update(
-                            {
-                                "rff_num_features": int(args.gp_rff_num_features),
-                                "opt_reference_size": int(args.gp_opt_reference_size),
-                                "opt_reference_seed_offset": args.gp_opt_reference_seed_offset,
-                                "rff_eval_batch_size": int(args.gp_rff_eval_batch_size),
-                            }
-                        )
-                suites.append(
-                    EvalSuiteSpec(
-                        name=suite_name,
-                        functions=gp_functions,
-                        oracle_noise_std=hparams.noise_std,
-                        baseline_hparams=hparams,
-                        eval_hparams=hparams,
-                        benchmark=benchmark,
+                gp_functions.append(
+                    sample_gp_function(
+                        n_grid=args.n_grid,
+                        input_dim=input_dim,
+                        hparams=hparams,
+                        seed=args.gp_seed_offset + gp_idx,
+                        grid_design=args.grid_design,
+                        grid_seed=args.grid_seed_offset + gp_idx,
+                        jitter=args.gp_jitter,
+                        support=args.gp_support,
+                        rff_num_features=args.gp_rff_num_features,
+                        opt_reference_size=args.gp_opt_reference_size,
+                        opt_reference_seed=opt_reference_seed,
+                        rff_eval_batch_size=args.gp_rff_eval_batch_size,
                     )
                 )
+            gp_functions = tuple(gp_functions)
+            suite_name = hparams.signature if input_dim == 1 else f"{hparams.signature}_d{input_dim}"
+            benchmark = None
+            if input_dim != 1 or args.gp_support != "grid":
+                benchmark = {
+                    "kind": "gp",
+                    "input_dim": int(input_dim),
+                    "support": args.gp_support,
+                    "grid_design": args.grid_design,
+                    "grid_seed_offset": int(args.grid_seed_offset),
+                    "gp_seed_offset": int(args.gp_seed_offset),
+                }
+                if args.gp_support == "continuous_rff":
+                    benchmark.update(
+                        {
+                            "rff_num_features": int(args.gp_rff_num_features),
+                            "opt_reference_size": int(args.gp_opt_reference_size),
+                            "opt_reference_seed_offset": args.gp_opt_reference_seed_offset,
+                            "rff_eval_batch_size": int(args.gp_rff_eval_batch_size),
+                        }
+                    )
+            suites.append(
+                EvalSuiteSpec(
+                    name=suite_name,
+                    functions=gp_functions,
+                    oracle_noise_std=hparams.noise_std,
+                    baseline_hparams=hparams,
+                    eval_hparams=hparams,
+                    benchmark=benchmark,
+                )
+            )
 
     if args.benchmark_mode in {"deterministic_only", "all"}:
         reference_hparams = eval_hparams[0]
@@ -1197,7 +382,8 @@ def make_agent_for_method(
     *,
     hparams: GPHyperparameters,
     args: argparse.Namespace,
-    pfn_factories: Mapping[str, Callable[[], PBOAgent]],
+    pfn_spec: Optional[PFNSpec],
+    pfn_model,
     bo_seed: int,
 ) -> PBOAgent:
     if method_name == "random":
@@ -1228,7 +414,17 @@ def make_agent_for_method(
             batch_eval_size=args.fixed_qeubo_batch_eval_size,
             support=args.gp_support,
         )
-    return pfn_factories[method_name]()
+    if method_name == PFN_METHOD:
+        if pfn_spec is None or pfn_model is None:
+            raise RuntimeError("PFN method was selected but no PFN checkpoint was loaded.")
+        return PairScorePFNAgent(
+            pfn_model,
+            device=args.device,
+            pair_batch_size=args.pfn_pair_batch_size,
+            input_dim=pfn_spec.input_dim,
+            support=args.gp_support,
+        )
+    raise ValueError(f"Unknown method {method_name!r}.")
 
 
 def hparams_equal(a: GPHyperparameters, b: GPHyperparameters) -> bool:
@@ -1241,7 +437,7 @@ def hparams_equal(a: GPHyperparameters, b: GPHyperparameters) -> bool:
 
 def method_metadata(
     method_name: str,
-    spec_by_method: Mapping[str, CheckpointSpec],
+    pfn_spec: Optional[PFNSpec],
     eval_hparams: Optional[GPHyperparameters],
     benchmark: Optional[Mapping],
 ) -> Dict:
@@ -1259,21 +455,24 @@ def method_metadata(
             "is_ranking_baseline": False,
         }
 
-    spec = spec_by_method[method_name]
+    if method_name != PFN_METHOD:
+        raise ValueError(f"Unknown method {method_name!r}.")
+    if pfn_spec is None:
+        raise RuntimeError("PFN metadata requested but no PFN spec was created.")
+    spec = pfn_spec
     is_in_domain = False if eval_hparams is None else hparams_equal(spec.train_hparams, eval_hparams)
     return {
         "method_name": method_name,
-        "kind": spec.kind,
+        "kind": "pair_score_pfn",
         "checkpoint": str(spec.checkpoint_path),
         "config": str(spec.config_path),
-        "config_template_name": spec.config_template_name,
         "prior_class": spec.prior_class,
         "input_dim": spec.input_dim,
         "train_hparams": spec.train_hparams.as_dict(),
         "eval_hparams": eval_hparams_dict,
         "benchmark": dict(benchmark) if benchmark is not None else None,
         "is_in_domain": is_in_domain,
-        "is_ranking_baseline": spec.is_ranking_baseline,
+        "is_ranking_baseline": False,
     }
 
 
@@ -1283,41 +482,30 @@ def main() -> None:
     if torch_device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested, but torch.cuda.is_available() is False.")
 
-    checkpoint_specs, skipped = discover_checkpoints(args)
-    spec_by_method = {spec.method_name: spec for spec in checkpoint_specs}
-    selected_methods = requested_methods(args, checkpoint_specs)
+    selected_methods = requested_methods(args)
+    validate_pfn_args(args, selected_methods)
     print(f"selected_methods: {selected_methods}")
     if not selected_methods:
         raise RuntimeError("No methods selected for evaluation.")
 
-    eval_hparams = sorted(
-        {spec.train_hparams for spec in checkpoint_specs},
-        key=lambda h: (h.lengthscale, h.outputscale, h.noise_std),
-    )
-    if not eval_hparams:
-        raise RuntimeError("No non-skipped PFN checkpoint configs found.")
+    train_hparams, prior_class = load_hparams_from_config(args.pfn_config)
+    eval_hparams = [train_hparams]
+    pfn_spec = make_pfn_spec(args, hparams=train_hparams, prior_class=prior_class)
 
     suite_specs = build_eval_suite_specs(args, eval_hparams)
     if not suite_specs:
         raise RuntimeError("No benchmark suites selected for evaluation.")
 
-    print("[discovery] selected methods:", ", ".join(selected_methods))
-    print("[discovery] eval hparams:", ", ".join(h.signature for h in eval_hparams))
-    print("[discovery] benchmark suites:", ", ".join(suite.name for suite in suite_specs))
-    if skipped:
-        print("[discovery] skipped:", json.dumps(skipped, indent=2))
+    print("[setup] selected methods:", ", ".join(selected_methods))
+    print("[setup] eval hparams:", ", ".join(h.signature for h in eval_hparams))
+    print("[setup] input_dim:", args.input_dim)
+    print("[setup] benchmark suites:", ", ".join(suite.name for suite in suite_specs))
 
-    pfn_models = {}
-    for spec in checkpoint_specs:
-        if spec.method_name in selected_methods:
-            print(f"[load] {spec.method_name} <- {spec.checkpoint_path}")
-            pfn_models[spec.method_name] = load_pfn_model(spec, args.device)
-
-    pfn_factories = {
-        spec.method_name: make_pfn_agent_factory(spec, pfn_models[spec.method_name], args)
-        for spec in checkpoint_specs
-        if spec.method_name in pfn_models
-    }
+    pfn_model = None
+    if PFN_METHOD in selected_methods:
+        assert pfn_spec is not None
+        print(f"[load] pfn <- {pfn_spec.checkpoint_path}")
+        pfn_model = load_pfn_model(pfn_spec, args.device)
 
     result = {
         "metadata": {
@@ -1336,8 +524,10 @@ def main() -> None:
             "gp_rff_eval_batch_size": args.gp_rff_eval_batch_size,
             "eps": args.eps,
             "device": args.device,
+            "input_dim": args.input_dim,
+            "pfn_checkpoint": str(args.pfn_checkpoint) if args.pfn_checkpoint is not None else None,
+            "pfn_config": str(args.pfn_config),
             "selected_methods": selected_methods,
-            "skipped_checkpoints": skipped,
             "benchmark_mode": args.benchmark_mode,
             "deterministic_benchmarks": args.deterministic_benchmarks,
             "deterministic_normalizations": args.deterministic_normalizations,
@@ -1384,7 +574,8 @@ def main() -> None:
                         method_name,
                         hparams=suite_spec.baseline_hparams,
                         args=args,
-                        pfn_factories=pfn_factories,
+                        pfn_spec=pfn_spec,
+                        pfn_model=pfn_model,
                         bo_seed=bo_seed,
                     )
 
@@ -1417,7 +608,7 @@ def main() -> None:
                 "utility_at_recommendation": utility_at_recommendation,
                 "metadata": method_metadata(
                     method_name,
-                    spec_by_method,
+                    pfn_spec,
                     suite_spec.eval_hparams,
                     suite_spec.benchmark,
                 ),

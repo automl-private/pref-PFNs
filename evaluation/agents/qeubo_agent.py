@@ -14,7 +14,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from .base import PBOAgent, Comparison, candidate_matrix, candidate_value
+from .base import PBOAgent, Comparison, Point, candidate_matrix, candidate_value
 
 try:
     from botorch.models.pairwise_gp import (
@@ -284,7 +284,7 @@ class QEUBOAgent(PBOAgent):
         self,
         comparisons: list[Comparison],
         candidate_pool: Tensor,
-    ) -> tuple:
+    ) -> tuple[Point, Point]:
         """
         Возвращает следующую пару точек для сравнения.
 
@@ -323,7 +323,7 @@ class QEUBOAgent(PBOAgent):
         self,
         comparisons: list[Comparison],
         candidate_pool: Tensor,
-    ):
+    ) -> Point:
         """
         Возвращает текущую рекомендацию лучшей точки.
 

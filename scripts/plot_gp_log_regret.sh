@@ -21,7 +21,7 @@ cmd=(
 )
 
 # Optional filter:
-#   METHODS="random qeubo pref_gp_1d_10M" bash scripts/plot_gp_log_regret.sh
+#   METHODS="random qeubo pfn" bash scripts/plot_gp_log_regret.sh
 if [[ -n "${METHODS:-}" ]]; then
   cmd+=(--methods ${METHODS})
 fi

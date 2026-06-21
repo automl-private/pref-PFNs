@@ -25,6 +25,7 @@ from torch import Tensor
 from .base import (
     PBOAgent,
     Comparison,
+    Point,
     candidate_matrix,
     candidate_value,
     nearest_candidate_index,
@@ -189,7 +190,7 @@ class GPPBOAgent(PBOAgent):
         self,
         comparisons: list[Comparison],
         candidate_pool: Tensor,
-    ):
+    ) -> Point:
         if not comparisons:
             return candidate_value(candidate_pool[candidate_pool.shape[0] // 2])
         f_mean, _ = self._posterior(comparisons, candidate_pool)
@@ -199,7 +200,7 @@ class GPPBOAgent(PBOAgent):
         self,
         comparisons: list[Comparison],
         candidate_pool: Tensor,
-    ) -> tuple:
+    ) -> tuple[Point, Point]:
         f_mean, f_cov = self._posterior(comparisons, candidate_pool)
 
         argmaxes = []

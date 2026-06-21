@@ -17,6 +17,7 @@ from torch import Tensor
 from .base import (
     Comparison,
     PBOAgent,
+    Point,
     candidate_matrix,
     candidate_value,
     nearest_candidate_index,
@@ -200,7 +201,7 @@ class FixedHyperparamQEUBOAgent(PBOAgent):
         self,
         comparisons: list[Comparison],
         candidate_pool: Tensor,
-    ) -> tuple:
+    ) -> tuple[Point, Point]:
         qeubo = self._qeubo_matrix(comparisons, candidate_pool)
         idx = torch.arange(qeubo.shape[0])
         qeubo[idx, idx] = -torch.inf
@@ -213,6 +214,6 @@ class FixedHyperparamQEUBOAgent(PBOAgent):
         self,
         comparisons: list[Comparison],
         candidate_pool: Tensor,
-    ):
+    ) -> Point:
         mean = self._posterior_mean(comparisons, candidate_pool)
         return candidate_value(candidate_pool[mean.argmax()])
