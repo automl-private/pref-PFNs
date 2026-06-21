@@ -16,8 +16,10 @@ mkdir -p "${SMOKE_ROOT}"
 echo "[smoke] python=${PYTHON_BIN}"
 echo "[smoke] root=${SMOKE_ROOT}"
 
-METHODS="random fixed_qeubo pref_gp_1d_10M pref_gp_1d_qeubo_10M" \
-ONLY_CHECKPOINTS="pfn_pref_gp_1d_10M.pt pfn_pref_gp_1d_qeubo_10M.pt" \
+METHODS="random fixed_qeubo pfn" \
+PFN_CHECKPOINT="checkpoints2/pfn_pref_gp_1d_qeubo_10M.pt" \
+PFN_CONFIG="my_configs2/train_pref_gp_1d_qeubo_10M.py" \
+INPUT_DIM=1 \
 N_GP_FUNCTIONS=1 \
 N_BO_SEEDS=1 \
 BUDGET=3 \
@@ -62,8 +64,7 @@ assert "suites" in results and results["suites"], "missing suites"
 expected_methods = {
     "random",
     "fixed_qeubo",
-    "pref_gp_1d_10M",
-    "pref_gp_1d_qeubo_10M",
+    "pfn",
 }
 
 for suite_name, suite in results["suites"].items():
