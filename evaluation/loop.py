@@ -26,22 +26,11 @@ def _candidate_pool_for_step(
     n_grid: int,
     generator: torch.Generator,
 ) -> torch.Tensor:
-    support = getattr(oracle, "support", "grid")
-
-    if support == "grid":
-        candidate_pool = getattr(oracle, "x_grid", None)
-        if candidate_pool is None:
-            raise ValueError("Grid oracle must expose x_grid.")
-        return candidate_pool
-
-    if support == "continuous_rff":
-        input_dim = int(getattr(oracle, "input_dim"))
-        pool = torch.rand(n_grid, input_dim, generator=generator, dtype=torch.float32)
-        if input_dim == 1:
-            return pool[:, 0]
-        return pool
-
-    raise ValueError(f"Unknown oracle support {support!r}.")
+    input_dim = int(getattr(oracle, "input_dim"))
+    pool = torch.rand(n_grid, input_dim, generator=generator, dtype=torch.float32)
+    if input_dim == 1:
+        return pool[:, 0]
+    return pool
 
 
 def run_bo_loop(
@@ -60,7 +49,7 @@ def run_bo_loop(
         budget:   Total number of comparisons (including init).
         n_init:   Number of random initial comparisons.
         seed:     RNG seed for reproducibility.
-        n_grid:   Grid size in grid mode; per-step candidate-pool size in continuous mode.
+        n_grid:   Per-step continuous candidate-pool size.
         verbose:  If True, print per-step info.
 
     Returns dict:

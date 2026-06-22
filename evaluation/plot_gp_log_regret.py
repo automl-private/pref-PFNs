@@ -118,17 +118,17 @@ def suite_subtitle(suite: Mapping, *, compact: bool = False) -> str:
         if benchmark.get("kind") == "gp":
             h = suite.get("eval_hparams", {})
             input_dim = benchmark.get("input_dim")
-            grid_design = benchmark.get("grid_design")
-            grid_seed_offset = benchmark.get("grid_seed_offset")
+            support = benchmark.get("support")
+            rff_num_features = benchmark.get("rff_num_features")
             if compact:
                 return (
-                    f"GP prior | d={input_dim} | grid={grid_design} | "
+                    f"GP prior | d={input_dim} | {support} | "
                     f"l={h.get('lengthscale')}, os={h.get('outputscale')}, "
                     f"noise={h.get('noise_std')}"
                 )
             return (
-                f"GP prior, input_dim={input_dim}, grid_design={grid_design}, "
-                f"grid_seed_offset={grid_seed_offset}, "
+                f"GP prior, input_dim={input_dim}, support={support}, "
+                f"rff_num_features={rff_num_features}, "
                 f"lengthscale={h.get('lengthscale')}, "
                 f"outputscale={h.get('outputscale')}, noise_std={h.get('noise_std')}"
             )
@@ -285,8 +285,9 @@ def write_summary(
                 "benchmark_normalization",
                 "benchmark_noise_std",
                 "benchmark_input_dim",
-                "benchmark_grid_design",
-                "benchmark_grid_seed_offset",
+                "benchmark_support",
+                "benchmark_rff_num_features",
+                "benchmark_opt_reference_size",
                 "method",
                 "kind",
                 "checkpoint",
@@ -338,8 +339,9 @@ def write_summary(
                             benchmark.get("normalization"),
                             benchmark.get("noise_std"),
                             benchmark.get("input_dim"),
-                            benchmark.get("grid_design"),
-                            benchmark.get("grid_seed_offset"),
+                            benchmark.get("support"),
+                            benchmark.get("rff_num_features"),
+                            benchmark.get("opt_reference_size"),
                             method_name,
                             metadata.get("kind"),
                             metadata.get("checkpoint"),

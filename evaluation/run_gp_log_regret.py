@@ -26,7 +26,6 @@ from dataclasses import dataclass, is_dataclass, replace
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence
 
-import gpytorch
 import torch
 
 if "MPLCONFIGDIR" not in os.environ:
@@ -36,22 +35,15 @@ if "XDG_CACHE_HOME" not in os.environ:
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from evaluation.agents import (
-    FixedHyperparamQEUBOAgent,
-    GPPBOAgent,
-    PairScorePFNAgent,
-    QEUBOAgent,
-    RandomAgent,
-)
+from evaluation.agents import PairScorePFNAgent, QEUBOAgent, RandomAgent
 from evaluation.agents.base import PBOAgent
-from evaluation.benchmarks_1d import BENCHMARKS_1D, make_benchmark_1d
 from evaluation.loop import run_bo_loop
 from pfns.run_training_cli import load_config_from_python
-from evaluation.oracle import EvalSuiteSpec, sample_gp_function, GaussianPreferenceOracle, SampledGPFunction, GPHyperparameters
+from evaluation.oracle import EvalSuiteSpec, sample_gp_function, GaussianPreferenceOracle, GPHyperparameters
 
 
 MULTIDIM_CHECKPOINT_RE = re.compile(r"^pref_gp_(\d+)d_(.+)$")
-BASELINE_METHODS = ("random", "gp_pbo", "qeubo", "fixed_qeubo")
+BASELINE_METHODS = ("random", "qeubo")
 PFN_METHOD = "pfn"
 VALID_METHODS = BASELINE_METHODS + (PFN_METHOD,)
 
@@ -85,15 +77,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-gp-functions", type=int, default=5)
     parser.add_argument("--n-bo-seeds", type=int, default=10)
     parser.add_argument("--n-grid", type=int, default=500)
-    parser.add_argument("--grid-design", choices=("uniform", "lhs"), default="uniform")
-    parser.add_argument("--grid-seed-offset", type=int, default=20_000)
-    parser.add_argument(
-        "--gp-support",
-        choices=("grid", "continuous_rff"),
-        default="grid",
-        help="Latent GP benchmark support. 'grid' preserves existing fixed-candidate evaluation.",
-    )
-    parser.add_argument("--gp-jitter", type=float, default=1e-6)
     parser.add_argument("--gp-rff-num-features", type=int, default=4096)
     parser.add_argument("--gp-opt-reference-size", type=int, default=65536)
     parser.add_argument(
@@ -109,44 +92,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--qeubo-num-acqf-samples", type=int, default=512)
     parser.add_argument("--qeubo-max-fit-iter", type=int, default=100)
     parser.add_argument("--qeubo-fit-hyperparams", action="store_true")
-    parser.add_argument("--fixed-qeubo-xtol", type=float, default=1e-6)
-    parser.add_argument("--fixed-qeubo-maxfev", type=int, default=100)
-    parser.add_argument("--fixed-qeubo-mc-samples", type=int, default=512)
-    parser.add_argument("--fixed-qeubo-batch-eval-size", type=int, default=2048)
-    parser.add_argument("--fixed-qeubo-jitter", type=float, default=1e-6)
-    parser.add_argument("--fixed-qeubo-mean-constant", type=float, default=0.0)
+    parser.add_argument("--qeubo-continuous-num-restarts", type=int, default=10)
+    parser.add_argument("--qeubo-continuous-raw-samples", type=int, default=256)
+    parser.add_argument("--qeubo-continuous-maxiter", type=int, default=100)
+    parser.add_argument("--qeubo-min-pair-distance", type=float, default=1e-6)
     parser.add_argument("--gp-seed-offset", type=int, default=0)
     parser.add_argument("--oracle-seed-offset", type=int, default=10_000)
-    parser.add_argument(
-        "--benchmark-mode",
-        choices=("gp_only", "deterministic_only", "all"),
-        default="gp_only",
-        help="Which benchmark suites to run. Default preserves the original GP-prior behavior.",
-    )
-    parser.add_argument(
-        "--deterministic-benchmarks",
-        nargs="+",
-        default=list(BENCHMARKS_1D.keys()),
-        help="Deterministic 1D benchmark names to run when benchmark mode includes them.",
-    )
-    parser.add_argument(
-        "--deterministic-normalizations",
-        nargs="+",
-        choices=("raw", "std1"),
-        default=["raw", "std1"],
-        help="Utility scaling modes for deterministic benchmark suites.",
-    )
-    parser.add_argument(
-        "--deterministic-noise-std",
-        type=float,
-        default=0.05,
-        help="Gaussian comparison noise used for deterministic benchmark suites.",
-    )
     parser.add_argument(
         "--methods",
         nargs="+",
         default=["all"],
-        help="Method names to run, or 'all'. Valid methods: random gp_pbo qeubo fixed_qeubo pfn.",
+        help="Method names to run, or 'all'. Valid methods: random qeubo pfn.",
     )
     parser.add_argument("--exclude-methods", nargs="*", default=[])
     parser.add_argument("--save-every-method", action="store_true", default=True)
@@ -281,98 +237,43 @@ def build_eval_suite_specs(
     suites: List[EvalSuiteSpec] = []
     input_dim = int(args.input_dim)
 
-    if args.benchmark_mode in {"gp_only", "all"}:
-        for hparams in eval_hparams:
-            gp_functions = []
-            for gp_idx in range(args.n_gp_functions):
-                opt_reference_seed = None
-                if args.gp_opt_reference_seed_offset is not None:
-                    opt_reference_seed = args.gp_opt_reference_seed_offset + gp_idx
+    for hparams in eval_hparams:
+        gp_functions = []
+        for gp_idx in range(args.n_gp_functions):
+            opt_reference_seed = None
+            if args.gp_opt_reference_seed_offset is not None:
+                opt_reference_seed = args.gp_opt_reference_seed_offset + gp_idx
 
-                gp_functions.append(
-                    sample_gp_function(
-                        n_grid=args.n_grid,
-                        input_dim=input_dim,
-                        hparams=hparams,
-                        seed=args.gp_seed_offset + gp_idx,
-                        grid_design=args.grid_design,
-                        grid_seed=args.grid_seed_offset + gp_idx,
-                        jitter=args.gp_jitter,
-                        support=args.gp_support,
-                        rff_num_features=args.gp_rff_num_features,
-                        opt_reference_size=args.gp_opt_reference_size,
-                        opt_reference_seed=opt_reference_seed,
-                        rff_eval_batch_size=args.gp_rff_eval_batch_size,
-                    )
-                )
-            gp_functions = tuple(gp_functions)
-            suite_name = hparams.signature if input_dim == 1 else f"{hparams.signature}_d{input_dim}"
-            benchmark = None
-            if input_dim != 1 or args.gp_support != "grid":
-                benchmark = {
-                    "kind": "gp",
-                    "input_dim": int(input_dim),
-                    "support": args.gp_support,
-                    "grid_design": args.grid_design,
-                    "grid_seed_offset": int(args.grid_seed_offset),
-                    "gp_seed_offset": int(args.gp_seed_offset),
-                }
-                if args.gp_support == "continuous_rff":
-                    benchmark.update(
-                        {
-                            "rff_num_features": int(args.gp_rff_num_features),
-                            "opt_reference_size": int(args.gp_opt_reference_size),
-                            "opt_reference_seed_offset": args.gp_opt_reference_seed_offset,
-                            "rff_eval_batch_size": int(args.gp_rff_eval_batch_size),
-                        }
-                    )
-            suites.append(
-                EvalSuiteSpec(
-                    name=suite_name,
-                    functions=gp_functions,
-                    oracle_noise_std=hparams.noise_std,
-                    baseline_hparams=hparams,
-                    eval_hparams=hparams,
-                    benchmark=benchmark,
+            gp_functions.append(
+                sample_gp_function(
+                    input_dim=input_dim,
+                    hparams=hparams,
+                    seed=args.gp_seed_offset + gp_idx,
+                    rff_num_features=args.gp_rff_num_features,
+                    opt_reference_size=args.gp_opt_reference_size,
+                    opt_reference_seed=opt_reference_seed,
+                    rff_eval_batch_size=args.gp_rff_eval_batch_size,
                 )
             )
-
-    if args.benchmark_mode in {"deterministic_only", "all"}:
-        reference_hparams = eval_hparams[0]
-        baseline_hparams = GPHyperparameters(
-            lengthscale=reference_hparams.lengthscale,
-            outputscale=reference_hparams.outputscale,
-            noise_std=args.deterministic_noise_std,
+        suites.append(
+            EvalSuiteSpec(
+                name=hparams.signature if input_dim == 1 else f"{hparams.signature}_d{input_dim}",
+                functions=tuple(gp_functions),
+                oracle_noise_std=hparams.noise_std,
+                baseline_hparams=hparams,
+                eval_hparams=hparams,
+                benchmark={
+                    "kind": "gp",
+                    "input_dim": int(input_dim),
+                    "support": "continuous_rff",
+                    "gp_seed_offset": int(args.gp_seed_offset),
+                    "rff_num_features": int(args.gp_rff_num_features),
+                    "opt_reference_size": int(args.gp_opt_reference_size),
+                    "opt_reference_seed_offset": args.gp_opt_reference_seed_offset,
+                    "rff_eval_batch_size": int(args.gp_rff_eval_batch_size),
+                },
+            )
         )
-        for benchmark_name in args.deterministic_benchmarks:
-            for normalization in args.deterministic_normalizations:
-                x_grid, f_grid = make_benchmark_1d(
-                    benchmark_name,
-                    n_grid=args.n_grid,
-                    normalization=normalization,
-                    device="cpu",
-                    grid_design=args.grid_design,
-                    grid_seed=args.grid_seed_offset,
-                )
-                suite_name = f"{benchmark_name}_{normalization}"
-                suites.append(
-                    EvalSuiteSpec(
-                        name=suite_name,
-                        functions=((x_grid, f_grid),),
-                        oracle_noise_std=args.deterministic_noise_std,
-                        baseline_hparams=baseline_hparams,
-                        eval_hparams=None,
-                        benchmark={
-                            "kind": "deterministic",
-                            "name": benchmark_name,
-                            "normalization": normalization,
-                            "noise_std": float(args.deterministic_noise_std),
-                            "reference_hparams": reference_hparams.as_dict(),
-                            "grid_design": args.grid_design,
-                            "grid_seed": int(args.grid_seed_offset),
-                        },
-                    )
-                )
 
     return suites
 
@@ -387,32 +288,16 @@ def make_agent_for_method(
     bo_seed: int,
 ) -> PBOAgent:
     if method_name == "random":
-        return RandomAgent(seed=bo_seed, support=args.gp_support)
-    if method_name == "gp_pbo":
-        return GPPBOAgent(
-            lengthscale=hparams.lengthscale,
-            outputscale=hparams.outputscale,
-            support=args.gp_support,
-        )
+        return RandomAgent(seed=bo_seed)
     if method_name == "qeubo":
         return QEUBOAgent(
             fit_hyperparams=args.qeubo_fit_hyperparams,
             max_fit_iter=args.qeubo_max_fit_iter,
             num_acqf_samples=args.qeubo_num_acqf_samples,
-            support=args.gp_support,
-        )
-    if method_name == "fixed_qeubo":
-        return FixedHyperparamQEUBOAgent(
-            lengthscale=hparams.lengthscale,
-            outputscale=hparams.outputscale,
-            noise_std=hparams.noise_std,
-            mean_constant=args.fixed_qeubo_mean_constant,
-            jitter=args.fixed_qeubo_jitter,
-            xtol=args.fixed_qeubo_xtol,
-            maxfev=args.fixed_qeubo_maxfev,
-            num_acqf_samples=args.fixed_qeubo_mc_samples,
-            batch_eval_size=args.fixed_qeubo_batch_eval_size,
-            support=args.gp_support,
+            continuous_num_restarts=args.qeubo_continuous_num_restarts,
+            continuous_raw_samples=args.qeubo_continuous_raw_samples,
+            continuous_maxiter=args.qeubo_continuous_maxiter,
+            min_pair_distance=args.qeubo_min_pair_distance,
         )
     if method_name == PFN_METHOD:
         if pfn_spec is None or pfn_model is None:
@@ -422,7 +307,6 @@ def make_agent_for_method(
             device=args.device,
             pair_batch_size=args.pfn_pair_batch_size,
             input_dim=pfn_spec.input_dim,
-            support=args.gp_support,
         )
     raise ValueError(f"Unknown method {method_name!r}.")
 
@@ -514,10 +398,7 @@ def main() -> None:
             "n_init": args.n_init,
             "n_gp_functions": args.n_gp_functions,
             "n_bo_seeds": args.n_bo_seeds,
-            "grid_design": args.grid_design,
-            "grid_seed_offset": args.grid_seed_offset,
-            "gp_support": args.gp_support,
-            "gp_jitter": args.gp_jitter,
+            "gp_support": "continuous_rff",
             "gp_rff_num_features": args.gp_rff_num_features,
             "gp_opt_reference_size": args.gp_opt_reference_size,
             "gp_opt_reference_seed_offset": args.gp_opt_reference_seed_offset,
@@ -528,10 +409,6 @@ def main() -> None:
             "pfn_checkpoint": str(args.pfn_checkpoint) if args.pfn_checkpoint is not None else None,
             "pfn_config": str(args.pfn_config),
             "selected_methods": selected_methods,
-            "benchmark_mode": args.benchmark_mode,
-            "deterministic_benchmarks": args.deterministic_benchmarks,
-            "deterministic_normalizations": args.deterministic_normalizations,
-            "deterministic_noise_std": args.deterministic_noise_std,
         },
         "suites": {},
     }
@@ -555,20 +432,11 @@ def main() -> None:
                 for bo_seed in range(args.n_bo_seeds):
                     seed = args.oracle_seed_offset + function_idx * 100_000 + bo_seed
 
-                    if isinstance(gp_function, SampledGPFunction):
-                        oracle = GaussianPreferenceOracle(
-                            gp_function=gp_function,
-                            noise_std=suite_spec.oracle_noise_std,
-                            seed=seed,
-                        )
-                    else:
-                        x_grid, f_grid = gp_function
-                        oracle = GaussianPreferenceOracle(
-                            x_grid=x_grid,
-                            f_grid=f_grid,
-                            noise_std=suite_spec.oracle_noise_std,
-                            seed=seed,
-                        )
+                    oracle = GaussianPreferenceOracle(
+                        gp_function=gp_function,
+                        noise_std=suite_spec.oracle_noise_std,
+                        seed=seed,
+                    )
 
                     agent = make_agent_for_method(
                         method_name,
