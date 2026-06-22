@@ -27,7 +27,7 @@ import torch
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Plot GP log10(simple regret) curves.")
+    parser = argparse.ArgumentParser(description="Plot log10(mean simple regret) curves.")
     parser.add_argument("--results", type=Path, default=Path("results/gp_log_regret/results.pt"))
     parser.add_argument("--out-dir", type=Path, default=Path("figures/gp_log_regret"))
     parser.add_argument("--summary-out", type=Path, default=Path("results/gp_log_regret/summary.csv"))
@@ -35,33 +35,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dpi", type=int, default=200)
     parser.add_argument("--title-prefix", type=str, default="GP preference BO")
     parser.add_argument("--eps", type=float, default=1e-12)
-    parser.add_argument(
-        "--metric",
-        choices=("mean_log10_regret", "log10_average_regret"),
-        default="mean_log10_regret",
-        help=(
-            "Metric to plot: mean_log10_regret plots E[log10(regret)], "
-            "log10_average_regret plots log10(E[regret])."
-        ),
-    )
     return parser.parse_args()
 
 
 def slugify(text: str) -> str:
     text = re.sub(r"[^A-Za-z0-9_.=-]+", "_", text)
     return text.strip("_")
-
-
-def mean_stderr(log10_regret: torch.Tensor) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    values = log10_regret.detach().cpu().float().reshape(-1, log10_regret.shape[-1])
-    counts = torch.isfinite(values).sum(dim=0)
-    mean = torch.nanmean(values, dim=0)
-    stderr = torch.zeros_like(mean)
-    for idx in range(values.shape[-1]):
-        finite = values[:, idx][torch.isfinite(values[:, idx])]
-        if finite.numel() > 1:
-            stderr[idx] = finite.std(unbiased=True) / math.sqrt(finite.numel())
-    return mean.numpy(), stderr.numpy(), counts.numpy()
 
 
 def average_regret_stderr(simple_regret: torch.Tensor) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -76,30 +55,16 @@ def average_regret_stderr(simple_regret: torch.Tensor) -> tuple[np.ndarray, np.n
     return mean.numpy(), stderr.numpy(), counts.numpy()
 
 
-def metric_series(
+def plot_series(
     payload: Mapping,
     *,
-    metric: str,
     eps: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    if metric == "mean_log10_regret":
-        y, err, counts = mean_stderr(payload["log10_regret"])
-        return y, y - err, y + err, counts
-    if metric == "log10_average_regret":
-        average_regret, err, counts = average_regret_stderr(payload["simple_regret"])
-        y = np.log10(np.maximum(average_regret, eps))
-        lower = np.log10(np.maximum(average_regret - err, eps))
-        upper = np.log10(np.maximum(average_regret + err, eps))
-        return y, lower, upper, counts
-    raise ValueError(f"Unknown plot metric {metric!r}.")
-
-
-def metric_ylabel(metric: str) -> str:
-    if metric == "mean_log10_regret":
-        return "mean log10(simple regret)"
-    if metric == "log10_average_regret":
-        return "log10(mean simple regret)"
-    raise ValueError(f"Unknown plot metric {metric!r}.")
+    average_regret, err, counts = average_regret_stderr(payload["simple_regret"])
+    y = np.log10(np.maximum(average_regret, eps))
+    lower = np.log10(np.maximum(average_regret - err, eps))
+    upper = np.log10(np.maximum(average_regret + err, eps))
+    return y, lower, upper, counts
 
 
 def display_label(method_name: str, metadata: Mapping) -> str:
@@ -160,7 +125,6 @@ def plot_suite(
     methods: Optional[Sequence[str]],
     dpi: int,
     title_prefix: str,
-    metric: str,
     eps: float,
 ) -> None:
     fig, ax = plt.subplots(figsize=(10.5, 6.2))
@@ -169,7 +133,7 @@ def plot_suite(
     for method_name, payload in suite["methods"].items():
         if methods is not None and method_name not in methods:
             continue
-        y, lower, upper, counts = metric_series(payload, metric=metric, eps=eps)
+        y, lower, upper, counts = plot_series(payload, eps=eps)
         x = np.arange(1, len(y) + 1)
         metadata = payload.get("metadata", {})
         linestyle = "--" if metadata.get("is_in_domain") is False else "-"
@@ -195,7 +159,7 @@ def plot_suite(
 
     ax.set_title(f"{title_prefix}\n{suite_subtitle(suite)}")
     ax.set_xlabel("# preference comparisons")
-    ax.set_ylabel(metric_ylabel(metric))
+    ax.set_ylabel("log10(mean simple regret)")
     ax.grid(True, alpha=0.25)
     ax.legend(fontsize=8, ncol=2)
     fig.tight_layout()
@@ -212,7 +176,6 @@ def plot_all_suites(
     methods: Optional[Sequence[str]],
     dpi: int,
     title_prefix: str,
-    metric: str,
     eps: float,
 ) -> None:
     suites = results["suites"]
@@ -229,7 +192,7 @@ def plot_all_suites(
         for method_name, payload in suite["methods"].items():
             if methods is not None and method_name not in methods:
                 continue
-            y, lower, upper, counts = metric_series(payload, metric=metric, eps=eps)
+            y, lower, upper, counts = plot_series(payload, eps=eps)
             x = np.arange(1, len(y) + 1)
             metadata = payload.get("metadata", {})
             linestyle = "--" if metadata.get("is_in_domain") is False else "-"
@@ -250,7 +213,7 @@ def plot_all_suites(
             )
         ax.set_title(suite_subtitle(suite, compact=True))
         ax.set_xlabel("# comparisons")
-        ax.set_ylabel(metric_ylabel(metric))
+        ax.set_ylabel("log10(mean simple regret)")
         ax.grid(True, alpha=0.25)
         ax.legend(fontsize=7, ncol=2)
 
@@ -300,8 +263,6 @@ def write_summary(
                 "is_in_domain",
                 "is_ranking_baseline",
                 "step",
-                "mean_log10_regret",
-                "stderr_log10_regret",
                 "average_regret",
                 "log10_average_regret",
                 "stderr_regret",
@@ -316,17 +277,14 @@ def write_summary(
                     continue
                 metadata = payload.get("metadata", {})
                 train_h = metadata.get("train_hparams") or {}
-                y, err, counts = mean_stderr(payload["log10_regret"])
                 average_regret, regret_err, regret_counts = average_regret_stderr(payload["simple_regret"])
                 log10_average_regret = np.log10(np.maximum(average_regret, eps))
-                for step, mean, stderr, avg_regret, log10_avg_regret, avg_regret_stderr, count in zip(
-                    range(1, len(y) + 1),
-                    y,
-                    err,
+                for step, avg_regret, log10_avg_regret, avg_regret_stderr, count in zip(
+                    range(1, len(average_regret) + 1),
                     average_regret,
                     log10_average_regret,
                     regret_err,
-                    np.minimum(counts, regret_counts),
+                    regret_counts,
                 ):
                     writer.writerow(
                         [
@@ -354,8 +312,6 @@ def write_summary(
                             metadata.get("is_in_domain"),
                             metadata.get("is_ranking_baseline"),
                             step,
-                            float(mean),
-                            float(stderr),
                             float(avg_regret),
                             float(log10_avg_regret),
                             float(avg_regret_stderr),
@@ -379,7 +335,6 @@ def main() -> None:
             methods=methods,
             dpi=args.dpi,
             title_prefix=args.title_prefix,
-            metric=args.metric,
             eps=args.eps,
         )
         print(f"[plot] saved {out_path}")
@@ -391,7 +346,6 @@ def main() -> None:
         methods=methods,
         dpi=args.dpi,
         title_prefix=args.title_prefix,
-        metric=args.metric,
         eps=args.eps,
     )
     if len(results["suites"]) > 1:

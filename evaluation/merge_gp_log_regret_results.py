@@ -18,7 +18,12 @@ COMPATIBLE_METADATA_KEYS = (
     "n_init",
     "n_gp_functions",
     "n_bo_seeds",
+    "gp_support",
+    "gp_rff_num_features",
+    "gp_opt_reference_size",
+    "gp_rff_eval_batch_size",
     "eps",
+    "input_dim",
 )
 
 
@@ -48,7 +53,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--allow-metadata-mismatch",
         action="store_true",
-        help="Allow differences in core benchmark metadata such as budget or n_grid.",
+        help=(
+            "Allow top-level run metadata differences such as budget or n_grid. "
+            "Suite eval_hparams and benchmark metadata must still match."
+        ),
     )
     parser.add_argument(
         "--allow-shape-mismatch",
@@ -119,9 +127,9 @@ def check_suite_metadata_compatible(
 
 
 def payload_shape(payload: Mapping[str, Any]) -> tuple[int, ...]:
-    value = payload.get("log10_regret")
+    value = payload.get("simple_regret")
     if not isinstance(value, torch.Tensor):
-        raise TypeError("method payload must contain tensor key 'log10_regret'.")
+        raise TypeError("method payload must contain tensor key 'simple_regret'.")
     return tuple(value.shape)
 
 
