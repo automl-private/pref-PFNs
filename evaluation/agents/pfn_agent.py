@@ -8,11 +8,19 @@ Uses the trained preference PFN model to:
 
 from __future__ import annotations
 
-from typing import List
-
 import torch
 
 from .base import PBOAgent, Comparison, Point, candidate_value
+
+try:
+    from botorch.acquisition.acquisition import AcquisitionFunction as _PBOAcquisitionFunction
+    from botorch.optim import optimize_acqf
+
+    _BOTORCH_AVAILABLE = True
+except ImportError:
+    _PBOAcquisitionFunction = torch.nn.Module
+    optimize_acqf = None
+    _BOTORCH_AVAILABLE = False
 
 
 def _build_pref_context(
@@ -124,7 +132,7 @@ class PairScorePFNAgent(PBOAgent):
         )
 
         batch_size = pairs.shape[0] if self.pair_batch_size <= 0 else self.pair_batch_size
-        chunks: List[torch.Tensor] = []
+        chunks: list[torch.Tensor] = []
         with torch.no_grad():
             for start in range(0, pairs.shape[0], batch_size):
                 test_x = pairs[start : start + batch_size].unsqueeze(0)
@@ -190,7 +198,7 @@ class PairScorePFNAgent(PBOAgent):
         if explore_k > 0:
             selected.extend(int(i) for i in torch.randperm(M)[:explore_k].tolist())
 
-        unique_indices: List[int] = []
+        unique_indices: list[int] = []
         seen = set()
         for idx in selected:
             if idx not in seen:
@@ -255,3 +263,208 @@ class PairScorePFNAgent(PBOAgent):
 
         diag = self._diag_scores(comparisons, candidate_pool)
         return candidate_value(candidate_pool[diag.argmax()])
+
+
+class PBOPFN(_PBOAcquisitionFunction):
+    """
+    Минимальная BoTorch acquisition-функция для pair-score PFN.
+
+    `.fit(...)` только кеширует preference context; веса PFN не меняются.
+    `forward(...)` принимает BoTorch tensor shape `batch_shape x q x d`:
+    при `q=2` скорит пару `(x1, x2)`, при `q=1` скорит диагональ `(x, x)`.
+    """
+
+    def __init__(
+        self,
+        model,
+        *,
+        device: str,
+        pair_batch_size: int,
+        input_dim: int,
+    ) -> None:
+        if _BOTORCH_AVAILABLE:
+            super().__init__(model=model)
+        else:
+            super().__init__()
+        self.model = model
+        self.model.eval()
+        self.device = torch.device(device)
+        self.criterion = model.criterion
+        self.pair_batch_size = int(pair_batch_size)
+        self.input_dim = int(input_dim)
+        self._x_ctx: torch.Tensor | None = None
+        self._y_ctx: torch.Tensor | None = None
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return next(self.model.parameters()).dtype
+
+    def fit(self, comparisons: list[Comparison]) -> "PBOPFN":
+        """
+        Запоминает историю сравнений как in-context данные для PFN.
+
+        Подготавливает контекст, но не обучает модель и не обновляет параметры checkpoint-а.
+        """
+        self._x_ctx, self._y_ctx = _build_pref_context(
+            comparisons,
+            dtype=self.dtype,
+            device=self.device,
+            input_dims=2 * self.input_dim,
+        )
+        return self
+
+    def score_pairs(self, pairs: torch.Tensor) -> torch.Tensor:
+        """
+        Скорит плоский список пар shape `(N, 2 * input_dim)`.
+
+        Возвращает tensor shape `(N,)`. Градиент по `pairs` сохраняется, чтобы
+        `optimize_acqf` мог оптимизировать acquisition-функцию.
+        """
+        if self._x_ctx is None or self._y_ctx is None:
+            raise RuntimeError("call .fit(comparisons) before scoring PBOPFN")
+
+        pairs = pairs.to(dtype=self.dtype, device=self.device)
+        expected_dim = 2 * self.input_dim
+        if pairs.ndim != 2 or pairs.shape[-1] != expected_dim:
+            raise ValueError(
+                f"Expected pairs with shape (N, {expected_dim}), got {tuple(pairs.shape)}."
+            )
+
+        batch_size = pairs.shape[0] if self.pair_batch_size <= 0 else self.pair_batch_size
+        chunks: list[torch.Tensor] = []
+        for start in range(0, pairs.shape[0], batch_size):
+            test_x = pairs[start : start + batch_size].unsqueeze(0) # (1, batch_size, 2d)
+            logits = self.model(self._x_ctx, self._y_ctx, test_x=test_x)
+            chunks.append(self.criterion.mean(logits).reshape(-1)) # средний predicted score, (batch_size,)
+        return torch.cat(chunks, dim=0) # (N,)
+
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        """
+        Возвращает acquisition score для BoTorch optimizer-а.
+
+        `X` должен иметь shape `batch_shape x q x d`. Для `q=2` две точки
+        конкатенируются в одну пару, а для `q=1` точка дублируется в `(x, x)`.
+        """
+        if X.ndim == 2:
+            X = X.unsqueeze(0)
+        if X.ndim < 3:
+            raise ValueError(f"Expected X with shape (..., q, d), got {tuple(X.shape)}.")
+        if X.shape[-1] != self.input_dim:
+            raise ValueError(
+                f"Expected input_dim={self.input_dim}, got X with shape {tuple(X.shape)}."
+            )
+        if X.shape[-2] not in (1, 2):
+            raise ValueError(
+                f"PBOPFN supports q=1 or q=2, got X with shape {tuple(X.shape)}."
+            )
+
+        X = X.to(dtype=self.dtype, device=self.device)
+        batch_shape = X.shape[:-2] # возьми все batch dimensions, кроме последних двух q и d
+
+        # переводит BoTorch-формат X в формат, который понимает pair-score PFN
+        # PFN ждёт не две отдельные точки, а одну строку-пару
+        # А BoTorch передаёт точки как: batch_shape x q x d
+        if X.shape[-2] == 1:
+            x = X.squeeze(-2)
+            pairs = torch.cat([x, x], dim=-1) # batch_shape x 2d
+        else:
+            pairs = X.reshape(*batch_shape, 2 * self.input_dim) # batch_shape1 x batch_shape2 x 2d
+
+        flat_pairs = pairs.reshape(-1, 2 * self.input_dim) # batch_shape1*batch_shape2 x 2d
+        scores = self.score_pairs(flat_pairs)
+        return scores.reshape(batch_shape)
+
+
+class BoTorchPairPFN(PBOAgent):
+    """
+    Continuous PBOAgent поверх `PBOPFN`.
+
+    Класс только адаптирует BoTorch-оптимизацию обратно к интерфейсу repo:
+    `suggest_pair` возвращает две точки, `recommend` возвращает одну точку.
+    """
+
+    def __init__(
+        self,
+        model,
+        *,
+        device: str,
+        pair_batch_size: int,
+        input_dim: int,
+        continuous_num_restarts: int = 10,
+        continuous_raw_samples: int = 128,
+        continuous_maxiter: int = 100,
+    ) -> None:
+        if not _BOTORCH_AVAILABLE:
+            raise ImportError(
+                "botorch is required for BoTorchPairPFN continuous acquisition optimization.\n"
+                "Install with:  pip install botorch"
+            )
+        self.model = model
+        self.model.eval()
+        self.device = torch.device(device)
+        self.pair_batch_size = int(pair_batch_size)
+        self.input_dim = int(input_dim)
+        self.continuous_num_restarts = int(continuous_num_restarts)
+        self.continuous_raw_samples = int(continuous_raw_samples)
+        self.continuous_maxiter = int(continuous_maxiter)
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return next(self.model.parameters()).dtype
+
+    def _make_acqf(self, comparisons: list[Comparison]) -> PBOPFN:
+        """Создает `PBOPFN` и кладет в него текущую историю сравнений."""
+        return PBOPFN(
+            self.model,
+            device=str(self.device),
+            pair_batch_size=self.pair_batch_size,
+            input_dim=self.input_dim,
+        ).fit(comparisons)
+
+    def _bounds(self) -> torch.Tensor:
+        """Возвращает continuous границы поиска `[0, 1]^d`."""
+        return torch.stack(
+            [
+                torch.zeros(self.input_dim, dtype=self.dtype, device=self.device),
+                torch.ones(self.input_dim, dtype=self.dtype, device=self.device),
+            ]
+        )
+
+    def _optimize_continuous(self, acqf: PBOPFN, *, q: int) -> torch.Tensor:
+        """Оптимизирует `PBOPFN` на `[0, 1]^d` для `q=1` или `q=2`."""
+        X_best, _ = optimize_acqf(
+            acq_function=acqf,
+            bounds=self._bounds(),
+            q=q,
+            num_restarts=self.continuous_num_restarts,
+            raw_samples=self.continuous_raw_samples,
+            options={"maxiter": self.continuous_maxiter},
+        )
+        return X_best.detach()
+
+    def suggest_pair(
+        self,
+        comparisons: list[Comparison],
+        candidate_pool: torch.Tensor,
+    ) -> tuple[Point, Point]:
+        """Возвращает следующую пару из continuous оптимизации pair-score PFN."""
+        if not comparisons:
+            idx = torch.randperm(len(candidate_pool))[:2]
+            return candidate_value(candidate_pool[idx[0]]), candidate_value(candidate_pool[idx[1]])
+
+        acqf = self._make_acqf(comparisons)
+        X_next = self._optimize_continuous(acqf, q=2)
+        return candidate_value(X_next[0]), candidate_value(X_next[1])
+
+    def recommend(
+        self,
+        comparisons: list[Comparison],
+        candidate_pool: torch.Tensor,
+    ) -> Point:
+        """Возвращает текущую лучшую точку через continuous оптимизацию `(x, x)`."""
+        if not comparisons:
+            return candidate_value(candidate_pool[len(candidate_pool) // 2])
+
+        acqf = self._make_acqf(comparisons)
+        X_best = self._optimize_continuous(acqf, q=1)[0]
+        return candidate_value(X_best)
