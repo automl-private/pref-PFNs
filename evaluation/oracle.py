@@ -145,7 +145,12 @@ def sample_gp_function(
     opt_reference_seed: Optional[int] = None,
     rff_eval_batch_size: int = 2048,
 ) -> SampledGPFunction:
-    """Sample a noiseless continuous RFF approximation to an RBF GP path."""
+    """
+    Sample a noiseless continuous RFF approximation to an RBF GP path.
+
+    The global optimum stored in `x_opt`/`f_opt` is estimated with batched
+    multi-start LBFGS over the normalized domain `[0, 1]^d`.
+    """
     if input_dim < 1:
         raise ValueError(f"input_dim must be positive, got {input_dim}")
 
@@ -187,19 +192,45 @@ def sample_gp_function(
     if opt_reference_seed is None:
         opt_reference_seed = int(seed) + 1_000_003
 
-    # последовательность Соболя для 
-    sobol = torch.quasirandom.SobolEngine(
-        dimension=input_dim,
-        scramble=True,
-        seed=int(opt_reference_seed),
-    )
-    x_reference = sobol.draw(int(opt_reference_size)).float()
-    # Вычисление значений GP на этих точках
-    f_reference = sampled.evaluate(x_reference, batch_size=rff_eval_batch_size)
+    opt_rng = torch.Generator(device="cpu")
+    opt_rng.manual_seed(int(opt_reference_seed))
 
-    # Поиск точки с максимальным значением
-    best_idx = int(f_reference.argmax().item())
-    best_x = x_reference[best_idx]
+    # `opt_reference_size` остается внешним budget-параметром, но для LBFGS
+    # ограничиваем число рестартов, чтобы старый default 65536 не запускал
+    # десятки тысяч локальных оптимизаций.
+    n_restarts = min(int(opt_reference_size), 64)
+    starts = torch.rand(n_restarts, input_dim, generator=opt_rng).clamp(1e-6, 1 - 1e-6)
+    starts[0].fill_(0.5)
+
+    # starts in [0,1]  --logit-->  raw_x in R
+    #                           |
+    #                           | LBFGS updates raw_x
+    #                           v
+    # new raw_x in R  --sigmoid-->  valid x in [0,1]
+
+    # Это переводит стартовую точку из constrained space (0, 1) в unconstrained space (-inf, +inf)
+    raw_x = torch.logit(starts).detach().clone().requires_grad_(True)
+    optimizer = torch.optim.LBFGS(
+        [raw_x],
+        max_iter=100,
+        line_search_fn="strong_wolfe",
+    )
+
+    def closure() -> torch.Tensor:
+        optimizer.zero_grad()
+        x = raw_x.sigmoid()
+        values = sampled.evaluate(x, batch_size=rff_eval_batch_size)
+        loss = -values.sum()
+        loss.backward()
+        return loss
+
+    optimizer.step(closure)
+
+    with torch.no_grad():
+        x_reference = raw_x.sigmoid().clamp(0.0, 1.0)
+        f_reference = sampled.evaluate(x_reference, batch_size=rff_eval_batch_size)
+        best_idx = int(f_reference.argmax().item())
+        best_x = x_reference[best_idx]
     # Для одномерного случая возвращается число с плавающей точкой; для многомерного – кортеж чисел
     x_opt = (
         float(best_x[0].item())
