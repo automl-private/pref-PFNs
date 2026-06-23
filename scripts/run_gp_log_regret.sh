@@ -61,7 +61,7 @@ else
 fi
 
 # Optional filters:
-#   METHODS="random qeubo qts qei qnei pfn" bash scripts/run_gp_log_regret.sh
+#   METHODS="random qeubo qts qei qnei pfn pfn_botorch" bash scripts/run_gp_log_regret.sh
 #   EXCLUDE_METHODS="qeubo" bash ...
 if [[ -n "${METHODS:-}" ]]; then
   cmd+=(--methods ${METHODS})

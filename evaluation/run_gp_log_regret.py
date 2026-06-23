@@ -3,8 +3,9 @@
 Run paper-style log10(simple regret) evaluation on GP preference tasks.
 
 The GP benchmark hyperparameters come from one explicit PFN config. Baselines
-can run without loading a PFN checkpoint; the optional PFN method is always the
-single pair-score PFN agent named "pfn".
+can run without loading a PFN checkpoint. PFN methods use one explicit
+checkpoint/config pair: "pfn" for `PairScorePFNAgent` and "pfn_botorch" for
+`BoTorchPairPFN`.
 
 The plotted quantity is:
 
@@ -36,6 +37,7 @@ if "XDG_CACHE_HOME" not in os.environ:
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from evaluation.agents import (
+    BoTorchPairPFN,
     PairScorePFNAgent,
     QEIAgent,
     QNEIAgent,
@@ -52,7 +54,9 @@ from evaluation.oracle import EvalSuiteSpec, sample_gp_function, GaussianPrefere
 MULTIDIM_CHECKPOINT_RE = re.compile(r"^pref_gp_(\d+)d_(.+)$")
 BASELINE_METHODS = ("random", "qeubo", "qts", "qei", "qnei")
 PFN_METHOD = "pfn"
-VALID_METHODS = BASELINE_METHODS + (PFN_METHOD,)
+PFN_BOTORCH_METHOD = "pfn_botorch"
+PFN_METHODS = (PFN_METHOD, PFN_BOTORCH_METHOD)
+VALID_METHODS = BASELINE_METHODS + PFN_METHODS
 
 
 @dataclass(frozen=True)
@@ -113,7 +117,10 @@ def parse_args() -> argparse.Namespace:
         "--methods",
         nargs="+",
         default=["all"],
-        help="Method names to run, or 'all'. Valid methods: random qeubo qts qei qnei pfn.",
+        help=(
+            "Method names to run, or 'all'. Valid methods: "
+            "random qeubo qts qei qnei pfn pfn_botorch."
+        ),
     )
     parser.add_argument("--exclude-methods", nargs="*", default=[])
     parser.add_argument("--save-every-method", action="store_true", default=True)
@@ -144,7 +151,7 @@ def requested_methods(args: argparse.Namespace) -> List[str]:
     if args.methods == ["all"]:
         selected = list(BASELINE_METHODS)
         if args.pfn_checkpoint is not None:
-            selected.append(PFN_METHOD)
+            selected.extend(PFN_METHODS)
     else:
         requested = list(args.methods)
         unknown = sorted(set(requested) - set(VALID_METHODS))
@@ -170,8 +177,8 @@ def validate_pfn_args(args: argparse.Namespace, selected_methods: Sequence[str])
         raise ValueError(f"--input-dim must be positive, got {args.input_dim}.")
     if args.pfn_config is None:
         raise ValueError("--pfn-config is required; it defines the GP eval hyperparameters.")
-    if PFN_METHOD in selected_methods and args.pfn_checkpoint is None:
-        raise ValueError("--pfn-checkpoint is required when --methods includes pfn.")
+    if any(method in PFN_METHODS for method in selected_methods) and args.pfn_checkpoint is None:
+        raise ValueError("--pfn-checkpoint is required when --methods includes a PFN method.")
     if args.pfn_checkpoint is None:
         return
 
@@ -327,6 +334,18 @@ def make_agent_for_method(
             pair_batch_size=args.pfn_pair_batch_size,
             input_dim=pfn_spec.input_dim,
         )
+    if method_name == PFN_BOTORCH_METHOD:
+        if pfn_spec is None or pfn_model is None:
+            raise RuntimeError("BoTorch PFN method was selected but no PFN checkpoint was loaded.")
+        return BoTorchPairPFN(
+            pfn_model,
+            device=args.device,
+            pair_batch_size=args.pfn_pair_batch_size,
+            input_dim=pfn_spec.input_dim,
+            continuous_num_restarts=args.qeubo_continuous_num_restarts,
+            continuous_raw_samples=args.qeubo_continuous_raw_samples,
+            continuous_maxiter=args.qeubo_continuous_maxiter,
+        )
     raise ValueError(f"Unknown method {method_name!r}.")
 
 
@@ -358,7 +377,7 @@ def method_metadata(
             "is_ranking_baseline": False,
         }
 
-    if method_name != PFN_METHOD:
+    if method_name not in PFN_METHODS:
         raise ValueError(f"Unknown method {method_name!r}.")
     if pfn_spec is None:
         raise RuntimeError("PFN metadata requested but no PFN spec was created.")
@@ -366,7 +385,7 @@ def method_metadata(
     is_in_domain = False if eval_hparams is None else hparams_equal(spec.train_hparams, eval_hparams)
     return {
         "method_name": method_name,
-        "kind": "pair_score_pfn",
+        "kind": "pair_score_pfn" if method_name == PFN_METHOD else "botorch_pair_pfn",
         "checkpoint": str(spec.checkpoint_path),
         "config": str(spec.config_path),
         "prior_class": spec.prior_class,
@@ -405,7 +424,7 @@ def main() -> None:
     print("[setup] benchmark suites:", ", ".join(suite.name for suite in suite_specs))
 
     pfn_model = None
-    if PFN_METHOD in selected_methods:
+    if any(method in PFN_METHODS for method in selected_methods):
         assert pfn_spec is not None
         print(f"[load] pfn <- {pfn_spec.checkpoint_path}")
         pfn_model = load_pfn_model(pfn_spec, args.device)

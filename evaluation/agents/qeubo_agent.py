@@ -178,6 +178,8 @@ class QEUBOAgent(PBOAgent):
 
         Эта ветка используется только когда `fit_hyperparams=False`: тогда GP
         не должен оставаться на BoTorch defaults, а получает параметры из config.
+        После смены kernel parameters нужно обновить cached quantities модели,
+        потому что `PairwiseGP.__init__` уже построил их на прежних defaults.
         """
         lengthscale = torch.full_like(
             model.covar_module.base_kernel.lengthscale,
@@ -191,6 +193,9 @@ class QEUBOAgent(PBOAgent):
             device=model.datapoints.device,
         )
         model.covar_module.outputscale = outputscale
+
+        transformed_dp = model.transform_inputs(model.datapoints)
+        model._update(transformed_dp)
 
     def _bounds_from_pool(self, candidate_pool: Tensor) -> Tensor:
         """
