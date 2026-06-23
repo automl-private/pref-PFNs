@@ -103,7 +103,11 @@ class QEUBOAgent(PBOAgent):
 
     Args:
         fit_hyperparams: Оптимизировать ли GP hyperparameters на каждом шаге.
+            По умолчанию выключено: kernel берется из PFN config.
         max_fit_iter: Максимум итераций для fit hyperparameters.
+        max_fit_attempts: Максимум попыток BoTorch fitting, если fit включен.
+        gp_lengthscale: RBF lengthscale из PFN config.
+        gp_outputscale: Kernel outputscale из PFN config.
         num_acqf_samples: Число MC-сэмплов для оценки qEUBO.
         dtype: dtype для GP-тензоров; для GP обычно устойчивее `float64`.
         continuous_num_restarts: Число рестартов для `optimize_acqf`.
@@ -113,9 +117,11 @@ class QEUBOAgent(PBOAgent):
 
     def __init__(
         self,
-        fit_hyperparams: bool = True,
+        fit_hyperparams: bool = False,
         max_fit_iter: int = 100,
         max_fit_attempts: int = 20,
+        gp_lengthscale: float | None = None,
+        gp_outputscale: float | None = None,
         num_acqf_samples: int = 64,
         dtype=torch.float64,
         continuous_num_restarts: int = 20,  # число стартов для optimize_acqf
@@ -127,6 +133,8 @@ class QEUBOAgent(PBOAgent):
         self.fit_hyperparams = fit_hyperparams
         self.max_fit_iter = max_fit_iter
         self.max_fit_attempts = int(max_fit_attempts)
+        self.gp_lengthscale = None if gp_lengthscale is None else float(gp_lengthscale)
+        self.gp_outputscale = None if gp_outputscale is None else float(gp_outputscale)
         self.num_acqf_samples = num_acqf_samples
         self.dtype = dtype
         self.continuous_num_restarts = int(continuous_num_restarts)
@@ -147,6 +155,7 @@ class QEUBOAgent(PBOAgent):
         datapoints, comp_idx = _build_pairwise_tensors(comparisons, dtype=self.dtype)
 
         model = PairwiseGP(datapoints, comp_idx)
+        self._apply_kernel_hparams(model)
         model.train()
 
         if self.fit_hyperparams:
@@ -159,6 +168,29 @@ class QEUBOAgent(PBOAgent):
 
         model.eval()
         return model
+
+    def _apply_kernel_hparams(self, model: "PairwiseGP") -> None:
+        """
+        Вставляет kernel hyperparameters из PFN config в `PairwiseGP`.
+
+        `noise_std` из config используется oracle-ом при генерации сравнений.
+        У `PairwiseProbitLikelihood` нет отдельного Gaussian noise parameter,
+        поэтому здесь выставляются только `lengthscale` и `outputscale`.
+        """
+        if self.gp_lengthscale is not None:
+            lengthscale = torch.full_like(
+                model.covar_module.base_kernel.lengthscale,
+                self.gp_lengthscale,
+            )
+            model.covar_module.base_kernel.lengthscale = lengthscale
+
+        if self.gp_outputscale is not None:
+            outputscale = torch.as_tensor(
+                self.gp_outputscale,
+                dtype=self.dtype,
+                device=model.datapoints.device,
+            )
+            model.covar_module.outputscale = outputscale
 
     def _bounds_from_pool(self, candidate_pool: Tensor) -> Tensor:
         """

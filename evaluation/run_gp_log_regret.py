@@ -102,7 +102,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--qeubo-fit-hyperparams",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
     )
     parser.add_argument("--qeubo-continuous-num-restarts", type=int, default=20)
     parser.add_argument("--qeubo-continuous-raw-samples", type=int, default=1024)
@@ -311,6 +311,8 @@ def make_agent_for_method(
             fit_hyperparams=args.qeubo_fit_hyperparams,
             max_fit_iter=args.qeubo_max_fit_iter,
             max_fit_attempts=args.qeubo_max_fit_attempts,
+            gp_lengthscale=hparams.lengthscale,
+            gp_outputscale=hparams.outputscale,
             num_acqf_samples=args.qeubo_num_acqf_samples,
             continuous_num_restarts=args.qeubo_continuous_num_restarts,
             continuous_raw_samples=args.qeubo_continuous_raw_samples,
