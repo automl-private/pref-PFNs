@@ -22,8 +22,13 @@ try:
     )
     from botorch.acquisition.preference import qExpectedUtilityOfBestOption
     from botorch.acquisition.analytic import PosteriorMean
+    from botorch.acquisition import qNoisyExpectedImprovement
+    from botorch.acquisition.monte_carlo import qExpectedImprovement
+    from botorch.generation import MaxPosteriorSampling
     from botorch.optim import optimize_acqf
     from botorch.fit import fit_gpytorch_mll
+    from botorch.sampling.normal import SobolQMCNormalSampler
+    from botorch.utils.sampling import draw_sobol_samples
 
     _BOTORCH_AVAILABLE = True
 except ImportError:
@@ -104,31 +109,29 @@ class QEUBOAgent(PBOAgent):
         continuous_num_restarts: Число рестартов для `optimize_acqf`.
         continuous_raw_samples: Число raw samples для выбора стартов optimizer.
         continuous_maxiter: Максимум итераций continuous optimizer.
-        min_pair_distance: Минимальная допустимая дистанция между двумя точками
-            в предложенной паре.
     """
 
     def __init__(
         self,
         fit_hyperparams: bool = True,
         max_fit_iter: int = 100,
-        num_acqf_samples: int = 512,
+        max_fit_attempts: int = 20,
+        num_acqf_samples: int = 64,
         dtype=torch.float64,
-        continuous_num_restarts: int = 10,  # число стартов для optimize_acqf
-        continuous_raw_samples: int = 256, # число raw samples для выбора стартовых точек
+        continuous_num_restarts: int = 20,  # число стартов для optimize_acqf
+        continuous_raw_samples: int = 1024, # число raw samples для выбора стартовых точек
         continuous_maxiter: int = 100, # лимит итераций optimizer.
-        min_pair_distance: float = 1e-6, # защита от пары (x, x)
     ):
         """Инициализирует qEUBO-агента и параметры continuous оптимизации."""
         _require_botorch()
         self.fit_hyperparams = fit_hyperparams
         self.max_fit_iter = max_fit_iter
+        self.max_fit_attempts = int(max_fit_attempts)
         self.num_acqf_samples = num_acqf_samples
         self.dtype = dtype
         self.continuous_num_restarts = int(continuous_num_restarts)
         self.continuous_raw_samples = int(continuous_raw_samples)
         self.continuous_maxiter = int(continuous_maxiter)
-        self.min_pair_distance = float(min_pair_distance)
 
     # ------------------------------------------------------------------
     # Internal
@@ -148,7 +151,11 @@ class QEUBOAgent(PBOAgent):
 
         if self.fit_hyperparams:
             mll = PairwiseLaplaceMarginalLogLikelihood(model.likelihood, model)
-            fit_gpytorch_mll(mll, max_attempts=1, options={"maxiter": self.max_fit_iter})
+            fit_gpytorch_mll(
+                mll,
+                max_attempts=self.max_fit_attempts,
+                options={"maxiter": self.max_fit_iter},
+            )
 
         model.eval()
         return model
@@ -169,14 +176,45 @@ class QEUBOAgent(PBOAgent):
             ]
         )
 
+    def _make_sampler(self):
+        """
+        Создает Sobol QMC sampler для MC acquisition functions.
+
+        PABBO использует `SAMPLE_SIZE = 64`; в runner-е это значение теперь
+        является default для `num_acqf_samples`.
+        """
+        return SobolQMCNormalSampler(sample_shape=torch.Size([self.num_acqf_samples]))
+
     def _make_qeubo_acqf(self, model: "PairwiseGP"):
         """
         Создает qEUBO acquisition function для обученной `PairwiseGP`.
         """
-        from botorch.sampling.normal import SobolQMCNormalSampler
+        return qExpectedUtilityOfBestOption(pref_model=model, sampler=self._make_sampler())
 
-        sampler = SobolQMCNormalSampler(sample_shape=torch.Size([self.num_acqf_samples]))
-        return qExpectedUtilityOfBestOption(pref_model=model, sampler=sampler)
+    def _optimize_acqf_continuous(
+        self,
+        acqf,
+        candidate_pool: Tensor,
+        *,
+        q: int,
+    ) -> Tensor:
+        """
+        Оптимизирует BoTorch acquisition function на `[0, 1]^d`.
+
+        Этот helper повторяет continuous ветку PABBO `pbo.py`: acquisition
+        оптимизируется через `optimize_acqf` с заданными raw samples и restarts.
+        """
+        bounds = self._bounds_from_pool(candidate_pool)
+
+        X_next, _ = optimize_acqf(
+            acq_function=acqf,
+            bounds=bounds,
+            q=q,
+            num_restarts=self.continuous_num_restarts,
+            raw_samples=self.continuous_raw_samples,
+            options={"maxiter": self.continuous_maxiter},
+        )
+        return X_next.detach()
 
     def _optimize_qeubo_continuous(
         self,
@@ -191,17 +229,7 @@ class QEUBOAgent(PBOAgent):
         для определения размерности области поиска.
         """
         acqf = self._make_qeubo_acqf(model)
-        bounds = self._bounds_from_pool(candidate_pool)
-
-        X_next, _ = optimize_acqf(
-            acq_function=acqf,
-            bounds=bounds,
-            q=2,
-            num_restarts=self.continuous_num_restarts,
-            raw_samples=self.continuous_raw_samples,
-            options={"maxiter": self.continuous_maxiter},
-        )
-        return X_next.detach()
+        return self._optimize_acqf_continuous(acqf, candidate_pool, q=2)
 
     def _optimize_mean_continuous(
         self,
@@ -227,26 +255,6 @@ class QEUBOAgent(PBOAgent):
         )
         return X_best.detach()[0]
 
-    def _ensure_distinct_pair(
-        self,
-        X_pair: Tensor,
-        candidate_pool: Tensor,
-    ) -> Tensor:
-        """
-        Гарантирует, что continuous optimizer не вернул пару почти одинаковых точек.
-
-        Если расстояние между точками меньше `min_pair_distance`, вторая точка
-        заменяется случайным challenger из `[0, 1]^d`.
-        """
-        if torch.linalg.norm(X_pair[0] - X_pair[1]) >= self.min_pair_distance:
-            return X_pair
-
-        bounds = self._bounds_from_pool(candidate_pool)
-        challenger = bounds[0] + torch.rand_like(bounds[0]) * (bounds[1] - bounds[0])
-        X_pair = X_pair.clone()
-        X_pair[1] = challenger
-        return X_pair
-
     # ------------------------------------------------------------------
     # PBOAgent interface
     # ------------------------------------------------------------------
@@ -268,7 +276,6 @@ class QEUBOAgent(PBOAgent):
 
         model = self._fit_model(comparisons)
         X_next = self._optimize_qeubo_continuous(model, candidate_pool)
-        X_next = self._ensure_distinct_pair(X_next, candidate_pool)
         return candidate_value(X_next[0]), candidate_value(X_next[1])
 
     def recommend(
@@ -287,3 +294,107 @@ class QEUBOAgent(PBOAgent):
         model = self._fit_model(comparisons)
         X_best = self._optimize_mean_continuous(model, candidate_pool)
         return candidate_value(X_best)
+
+
+class QEIAgent(QEUBOAgent):
+    """
+    PABBO-style qEI baseline on top of BoTorch `PairwiseGP`.
+
+    The acquisition is `qExpectedImprovement` with `best_f` equal to the maximum
+    posterior mean over currently observed datapoints, matching `pbo.py`.
+    """
+
+    def _make_qei_acqf(self, model: "PairwiseGP"):
+        posterior = model.posterior(model.datapoints)
+        best_f = posterior.mean.max().item()
+        return qExpectedImprovement(
+            model=model,
+            best_f=best_f,
+            sampler=self._make_sampler(),
+        )
+
+    def suggest_pair(
+        self,
+        comparisons: list[Comparison],
+        candidate_pool: Tensor,
+    ) -> tuple[Point, Point]:
+        """Возвращает пару, выбранную continuous qEI acquisition."""
+        if not comparisons:
+            idx = torch.randperm(len(candidate_pool))[:2]
+            return candidate_value(candidate_pool[idx[0]]), candidate_value(candidate_pool[idx[1]])
+
+        model = self._fit_model(comparisons)
+        acqf = self._make_qei_acqf(model)
+        X_next = self._optimize_acqf_continuous(acqf, candidate_pool, q=2)
+        return candidate_value(X_next[0]), candidate_value(X_next[1])
+
+
+class QNEIAgent(QEUBOAgent):
+    """
+    PABBO-style qNEI baseline on top of BoTorch `PairwiseGP`.
+
+    The baseline set is the observed datapoints from the current preference GP.
+    """
+
+    def _make_qnei_acqf(self, model: "PairwiseGP"):
+        return qNoisyExpectedImprovement(
+            model=model,
+            X_baseline=model.datapoints,
+            sampler=self._make_sampler(),
+            prune_baseline=True,
+        )
+
+    def suggest_pair(
+        self,
+        comparisons: list[Comparison],
+        candidate_pool: Tensor,
+    ) -> tuple[Point, Point]:
+        """Возвращает пару, выбранную continuous qNEI acquisition."""
+        if not comparisons:
+            idx = torch.randperm(len(candidate_pool))[:2]
+            return candidate_value(candidate_pool[idx[0]]), candidate_value(candidate_pool[idx[1]])
+
+        model = self._fit_model(comparisons)
+        acqf = self._make_qnei_acqf(model)
+        X_next = self._optimize_acqf_continuous(acqf, candidate_pool, q=2)
+        return candidate_value(X_next[0]), candidate_value(X_next[1])
+
+
+class QTSAgent(QEUBOAgent):
+    """
+    PABBO-style qTS baseline on top of BoTorch `PairwiseGP`.
+
+    Each point in the pair is selected by posterior Thompson sampling over a
+    fresh Sobol candidate set from `[0, 1]^d`.
+    """
+
+    def _thompson_point(self, model: "PairwiseGP", bounds: Tensor) -> Tensor:
+        """Samples one posterior maximizer from a Sobol candidate set."""
+        choices = draw_sobol_samples(
+            bounds=bounds,
+            n=self.continuous_raw_samples,
+            q=1,
+        ).squeeze(-2)
+        thompson_sampling = MaxPosteriorSampling(model=model, replacement=False)
+        return thompson_sampling(choices, num_samples=1).reshape(1, -1)
+
+    def suggest_pair(
+        self,
+        comparisons: list[Comparison],
+        candidate_pool: Tensor,
+    ) -> tuple[Point, Point]:
+        """Возвращает пару, выбранную continuous Thompson sampling."""
+        if not comparisons:
+            idx = torch.randperm(len(candidate_pool))[:2]
+            return candidate_value(candidate_pool[idx[0]]), candidate_value(candidate_pool[idx[1]])
+
+        model = self._fit_model(comparisons)
+        bounds = self._bounds_from_pool(candidate_pool)
+        X_next = torch.cat(
+            [
+                self._thompson_point(model, bounds),
+                self._thompson_point(model, bounds),
+            ],
+            dim=0,
+        )
+        return candidate_value(X_next[0]), candidate_value(X_next[1])

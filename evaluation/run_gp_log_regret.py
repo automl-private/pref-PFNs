@@ -35,7 +35,14 @@ if "XDG_CACHE_HOME" not in os.environ:
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from evaluation.agents import PairScorePFNAgent, QEUBOAgent, RandomAgent
+from evaluation.agents import (
+    PairScorePFNAgent,
+    QEIAgent,
+    QNEIAgent,
+    QEUBOAgent,
+    QTSAgent,
+    RandomAgent,
+)
 from evaluation.agents.base import PBOAgent
 from evaluation.loop import run_bo_loop
 from pfns.run_training_cli import load_config_from_python
@@ -43,7 +50,7 @@ from evaluation.oracle import EvalSuiteSpec, sample_gp_function, GaussianPrefere
 
 
 MULTIDIM_CHECKPOINT_RE = re.compile(r"^pref_gp_(\d+)d_(.+)$")
-BASELINE_METHODS = ("random", "qeubo")
+BASELINE_METHODS = ("random", "qeubo", "qts", "qei", "qnei")
 PFN_METHOD = "pfn"
 VALID_METHODS = BASELINE_METHODS + (PFN_METHOD,)
 
@@ -89,20 +96,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eps", type=float, default=1e-12)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--pfn-pair-batch-size", type=int, default=4096)
-    parser.add_argument("--qeubo-num-acqf-samples", type=int, default=512)
+    parser.add_argument("--qeubo-num-acqf-samples", type=int, default=64)
     parser.add_argument("--qeubo-max-fit-iter", type=int, default=100)
-    parser.add_argument("--qeubo-fit-hyperparams", action="store_true")
-    parser.add_argument("--qeubo-continuous-num-restarts", type=int, default=10)
-    parser.add_argument("--qeubo-continuous-raw-samples", type=int, default=256)
+    parser.add_argument("--qeubo-max-fit-attempts", type=int, default=20)
+    parser.add_argument(
+        "--qeubo-fit-hyperparams",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--qeubo-continuous-num-restarts", type=int, default=20)
+    parser.add_argument("--qeubo-continuous-raw-samples", type=int, default=1024)
     parser.add_argument("--qeubo-continuous-maxiter", type=int, default=100)
-    parser.add_argument("--qeubo-min-pair-distance", type=float, default=1e-6)
     parser.add_argument("--gp-seed-offset", type=int, default=0)
     parser.add_argument("--oracle-seed-offset", type=int, default=10_000)
     parser.add_argument(
         "--methods",
         nargs="+",
         default=["all"],
-        help="Method names to run, or 'all'. Valid methods: random qeubo pfn.",
+        help="Method names to run, or 'all'. Valid methods: random qeubo qts qei qnei pfn.",
     )
     parser.add_argument("--exclude-methods", nargs="*", default=[])
     parser.add_argument("--save-every-method", action="store_true", default=True)
@@ -289,15 +300,21 @@ def make_agent_for_method(
 ) -> PBOAgent:
     if method_name == "random":
         return RandomAgent(seed=bo_seed)
-    if method_name == "qeubo":
-        return QEUBOAgent(
+    botorch_baselines = {
+        "qeubo": QEUBOAgent,
+        "qts": QTSAgent,
+        "qei": QEIAgent,
+        "qnei": QNEIAgent,
+    }
+    if method_name in botorch_baselines:
+        return botorch_baselines[method_name](
             fit_hyperparams=args.qeubo_fit_hyperparams,
             max_fit_iter=args.qeubo_max_fit_iter,
+            max_fit_attempts=args.qeubo_max_fit_attempts,
             num_acqf_samples=args.qeubo_num_acqf_samples,
             continuous_num_restarts=args.qeubo_continuous_num_restarts,
             continuous_raw_samples=args.qeubo_continuous_raw_samples,
             continuous_maxiter=args.qeubo_continuous_maxiter,
-            min_pair_distance=args.qeubo_min_pair_distance,
         )
     if method_name == PFN_METHOD:
         if pfn_spec is None or pfn_model is None:
@@ -403,6 +420,13 @@ def main() -> None:
             "gp_opt_reference_size": args.gp_opt_reference_size,
             "gp_opt_reference_seed_offset": args.gp_opt_reference_seed_offset,
             "gp_rff_eval_batch_size": args.gp_rff_eval_batch_size,
+            "qeubo_num_acqf_samples": args.qeubo_num_acqf_samples,
+            "qeubo_max_fit_iter": args.qeubo_max_fit_iter,
+            "qeubo_max_fit_attempts": args.qeubo_max_fit_attempts,
+            "qeubo_fit_hyperparams": args.qeubo_fit_hyperparams,
+            "qeubo_continuous_num_restarts": args.qeubo_continuous_num_restarts,
+            "qeubo_continuous_raw_samples": args.qeubo_continuous_raw_samples,
+            "qeubo_continuous_maxiter": args.qeubo_continuous_maxiter,
             "eps": args.eps,
             "device": args.device,
             "input_dim": args.input_dim,

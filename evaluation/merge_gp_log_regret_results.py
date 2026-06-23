@@ -22,6 +22,13 @@ COMPATIBLE_METADATA_KEYS = (
     "gp_rff_num_features",
     "gp_opt_reference_size",
     "gp_rff_eval_batch_size",
+    "qeubo_num_acqf_samples",
+    "qeubo_max_fit_iter",
+    "qeubo_max_fit_attempts",
+    "qeubo_fit_hyperparams",
+    "qeubo_continuous_num_restarts",
+    "qeubo_continuous_raw_samples",
+    "qeubo_continuous_maxiter",
     "eps",
     "input_dim",
 )

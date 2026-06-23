@@ -19,13 +19,13 @@ EPS="${EPS:-1e-12}"
 DEVICE="${DEVICE:-cpu}"
 
 PFN_PAIR_BATCH_SIZE="${PFN_PAIR_BATCH_SIZE:-4096}"
-QEUBO_NUM_ACQF_SAMPLES="${QEUBO_NUM_ACQF_SAMPLES:-512}"
+QEUBO_NUM_ACQF_SAMPLES="${QEUBO_NUM_ACQF_SAMPLES:-64}"
 QEUBO_MAX_FIT_ITER="${QEUBO_MAX_FIT_ITER:-100}"
-QEUBO_FIT_HYPERPARAMS="${QEUBO_FIT_HYPERPARAMS:-0}"
-QEUBO_CONTINUOUS_NUM_RESTARTS="${QEUBO_CONTINUOUS_NUM_RESTARTS:-10}"
-QEUBO_CONTINUOUS_RAW_SAMPLES="${QEUBO_CONTINUOUS_RAW_SAMPLES:-256}"
+QEUBO_MAX_FIT_ATTEMPTS="${QEUBO_MAX_FIT_ATTEMPTS:-20}"
+QEUBO_FIT_HYPERPARAMS="${QEUBO_FIT_HYPERPARAMS:-1}"
+QEUBO_CONTINUOUS_NUM_RESTARTS="${QEUBO_CONTINUOUS_NUM_RESTARTS:-20}"
+QEUBO_CONTINUOUS_RAW_SAMPLES="${QEUBO_CONTINUOUS_RAW_SAMPLES:-1024}"
 QEUBO_CONTINUOUS_MAXITER="${QEUBO_CONTINUOUS_MAXITER:-100}"
-QEUBO_MIN_PAIR_DISTANCE="${QEUBO_MIN_PAIR_DISTANCE:-1e-6}"
 
 cmd=(
   "${PYTHON_BIN}" evaluation/run_gp_log_regret.py
@@ -41,10 +41,10 @@ cmd=(
   --pfn-pair-batch-size "${PFN_PAIR_BATCH_SIZE}"
   --qeubo-num-acqf-samples "${QEUBO_NUM_ACQF_SAMPLES}"
   --qeubo-max-fit-iter "${QEUBO_MAX_FIT_ITER}"
+  --qeubo-max-fit-attempts "${QEUBO_MAX_FIT_ATTEMPTS}"
   --qeubo-continuous-num-restarts "${QEUBO_CONTINUOUS_NUM_RESTARTS}"
   --qeubo-continuous-raw-samples "${QEUBO_CONTINUOUS_RAW_SAMPLES}"
   --qeubo-continuous-maxiter "${QEUBO_CONTINUOUS_MAXITER}"
-  --qeubo-min-pair-distance "${QEUBO_MIN_PAIR_DISTANCE}"
 )
 
 if [[ -n "${PFN_CHECKPOINT}" ]]; then
@@ -56,10 +56,12 @@ fi
 
 if [[ "${QEUBO_FIT_HYPERPARAMS}" == "1" ]]; then
   cmd+=(--qeubo-fit-hyperparams)
+else
+  cmd+=(--no-qeubo-fit-hyperparams)
 fi
 
 # Optional filters:
-#   METHODS="random qeubo pfn" bash scripts/run_gp_log_regret.sh
+#   METHODS="random qeubo qts qei qnei pfn" bash scripts/run_gp_log_regret.sh
 #   EXCLUDE_METHODS="qeubo" bash ...
 if [[ -n "${METHODS:-}" ]]; then
   cmd+=(--methods ${METHODS})

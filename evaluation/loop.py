@@ -92,9 +92,13 @@ def run_bo_loop(
             x1, x2 = agent.suggest_pair(comparisons, candidate_pool)
             phase = "bo"
 
+        f1_true = oracle.f_at(x1)
+        f2_true = oracle.f_at(x2)
+
         # compares the candidates using the oracle's latent function
         winner, loser = oracle.compare(x1, x2)
         comparisons.append((winner, loser))
+        agent.observe_pair(x1, x2, f1_true, f2_true)
 
         # --- recommend current best ---
         x_hat = agent.recommend(comparisons, candidate_pool)
