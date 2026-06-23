@@ -103,36 +103,41 @@ class QEUBOAgent(PBOAgent):
 
     Args:
         fit_hyperparams: Оптимизировать ли GP hyperparameters на каждом шаге.
-            По умолчанию выключено: kernel берется из PFN config.
         max_fit_iter: Максимум итераций для fit hyperparameters.
-        max_fit_attempts: Максимум попыток BoTorch fitting, если fit включен.
-        gp_lengthscale: RBF lengthscale из PFN config.
-        gp_outputscale: Kernel outputscale из PFN config.
         num_acqf_samples: Число MC-сэмплов для оценки qEUBO.
         dtype: dtype для GP-тензоров; для GP обычно устойчивее `float64`.
         continuous_num_restarts: Число рестартов для `optimize_acqf`.
         continuous_raw_samples: Число raw samples для выбора стартов optimizer.
         continuous_maxiter: Максимум итераций continuous optimizer.
+        min_pair_distance: Минимальная допустимая дистанция между двумя точками
+            в предложенной паре.
+        gp_lengthscale: RBF lengthscale для случая `fit_hyperparams=False`.
+        gp_outputscale: Kernel outputscale для случая `fit_hyperparams=False`.
     """
 
     def __init__(
         self,
-        fit_hyperparams: bool = False,
+        fit_hyperparams: bool = True,
         max_fit_iter: int = 100,
-        max_fit_attempts: int = 20,
+        num_acqf_samples: int = 512,
+        dtype=torch.float64,
+        continuous_num_restarts: int = 10,  # число стартов для optimize_acqf
+        continuous_raw_samples: int = 256, # число raw samples для выбора стартовых точек
+        continuous_maxiter: int = 100, # лимит итераций optimizer.
+        min_pair_distance: float = 1e-6, # защита от пары (x, x)
+        max_fit_attempts: int | None = None,
         gp_lengthscale: float | None = None,
         gp_outputscale: float | None = None,
-        num_acqf_samples: int = 64,
-        dtype=torch.float64,
-        continuous_num_restarts: int = 20,  # число стартов для optimize_acqf
-        continuous_raw_samples: int = 1024, # число raw samples для выбора стартовых точек
-        continuous_maxiter: int = 100, # лимит итераций optimizer.
     ):
         """Инициализирует qEUBO-агента и параметры continuous оптимизации."""
         _require_botorch()
         self.fit_hyperparams = fit_hyperparams
         self.max_fit_iter = max_fit_iter
-        self.max_fit_attempts = int(max_fit_attempts)
+        if not self.fit_hyperparams and (gp_lengthscale is None or gp_outputscale is None):
+            raise ValueError(
+                "QEUBOAgent requires gp_lengthscale and gp_outputscale "
+                "when fit_hyperparams=False."
+            )
         self.gp_lengthscale = None if gp_lengthscale is None else float(gp_lengthscale)
         self.gp_outputscale = None if gp_outputscale is None else float(gp_outputscale)
         self.num_acqf_samples = num_acqf_samples
@@ -140,6 +145,7 @@ class QEUBOAgent(PBOAgent):
         self.continuous_num_restarts = int(continuous_num_restarts)
         self.continuous_raw_samples = int(continuous_raw_samples)
         self.continuous_maxiter = int(continuous_maxiter)
+        self.min_pair_distance = float(min_pair_distance)
 
     # ------------------------------------------------------------------
     # Internal
@@ -155,42 +161,36 @@ class QEUBOAgent(PBOAgent):
         datapoints, comp_idx = _build_pairwise_tensors(comparisons, dtype=self.dtype)
 
         model = PairwiseGP(datapoints, comp_idx)
-        self._apply_kernel_hparams(model)
         model.train()
 
         if self.fit_hyperparams:
             mll = PairwiseLaplaceMarginalLogLikelihood(model.likelihood, model)
-            fit_gpytorch_mll(
-                mll,
-                max_attempts=self.max_fit_attempts,
-                options={"maxiter": self.max_fit_iter},
-            )
+            fit_gpytorch_mll(mll, max_attempts=1, options={"maxiter": self.max_fit_iter})
+        else:
+            self._apply_kernel_hparams(model)
 
         model.eval()
         return model
 
     def _apply_kernel_hparams(self, model: "PairwiseGP") -> None:
         """
-        Вставляет kernel hyperparameters из PFN config в `PairwiseGP`.
+        Вставляет fixed kernel hyperparameters в `PairwiseGP`.
 
-        `noise_std` из config используется oracle-ом при генерации сравнений.
-        У `PairwiseProbitLikelihood` нет отдельного Gaussian noise parameter,
-        поэтому здесь выставляются только `lengthscale` и `outputscale`.
+        Эта ветка используется только когда `fit_hyperparams=False`: тогда GP
+        не должен оставаться на BoTorch defaults, а получает параметры из config.
         """
-        if self.gp_lengthscale is not None:
-            lengthscale = torch.full_like(
-                model.covar_module.base_kernel.lengthscale,
-                self.gp_lengthscale,
-            )
-            model.covar_module.base_kernel.lengthscale = lengthscale
+        lengthscale = torch.full_like(
+            model.covar_module.base_kernel.lengthscale,
+            self.gp_lengthscale,
+        )
+        model.covar_module.base_kernel.lengthscale = lengthscale
 
-        if self.gp_outputscale is not None:
-            outputscale = torch.as_tensor(
-                self.gp_outputscale,
-                dtype=self.dtype,
-                device=model.datapoints.device,
-            )
-            model.covar_module.outputscale = outputscale
+        outputscale = torch.as_tensor(
+            self.gp_outputscale,
+            dtype=self.dtype,
+            device=model.datapoints.device,
+        )
+        model.covar_module.outputscale = outputscale
 
     def _bounds_from_pool(self, candidate_pool: Tensor) -> Tensor:
         """
@@ -209,19 +209,17 @@ class QEUBOAgent(PBOAgent):
         )
 
     def _make_sampler(self):
-        """
-        Создает Sobol QMC sampler для MC acquisition functions.
-
-        PABBO использует `SAMPLE_SIZE = 64`; в runner-е это значение теперь
-        является default для `num_acqf_samples`.
-        """
+        """Создает Sobol QMC sampler для subclasses в этом файле."""
         return SobolQMCNormalSampler(sample_shape=torch.Size([self.num_acqf_samples]))
 
     def _make_qeubo_acqf(self, model: "PairwiseGP"):
         """
         Создает qEUBO acquisition function для обученной `PairwiseGP`.
         """
-        return qExpectedUtilityOfBestOption(pref_model=model, sampler=self._make_sampler())
+        from botorch.sampling.normal import SobolQMCNormalSampler
+
+        sampler = SobolQMCNormalSampler(sample_shape=torch.Size([self.num_acqf_samples]))
+        return qExpectedUtilityOfBestOption(pref_model=model, sampler=sampler)
 
     def _optimize_acqf_continuous(
         self,
@@ -261,7 +259,17 @@ class QEUBOAgent(PBOAgent):
         для определения размерности области поиска.
         """
         acqf = self._make_qeubo_acqf(model)
-        return self._optimize_acqf_continuous(acqf, candidate_pool, q=2)
+        bounds = self._bounds_from_pool(candidate_pool)
+
+        X_next, _ = optimize_acqf(
+            acq_function=acqf,
+            bounds=bounds,
+            q=2,
+            num_restarts=self.continuous_num_restarts,
+            raw_samples=self.continuous_raw_samples,
+            options={"maxiter": self.continuous_maxiter},
+        )
+        return X_next.detach()
 
     def _optimize_mean_continuous(
         self,
@@ -287,6 +295,26 @@ class QEUBOAgent(PBOAgent):
         )
         return X_best.detach()[0]
 
+    def _ensure_distinct_pair(
+        self,
+        X_pair: Tensor,
+        candidate_pool: Tensor,
+    ) -> Tensor:
+        """
+        Гарантирует, что continuous optimizer не вернул пару почти одинаковых точек.
+
+        Если расстояние между точками меньше `min_pair_distance`, вторая точка
+        заменяется случайным challenger из `[0, 1]^d`.
+        """
+        if torch.linalg.norm(X_pair[0] - X_pair[1]) >= self.min_pair_distance:
+            return X_pair
+
+        bounds = self._bounds_from_pool(candidate_pool)
+        challenger = bounds[0] + torch.rand_like(bounds[0]) * (bounds[1] - bounds[0])
+        X_pair = X_pair.clone()
+        X_pair[1] = challenger
+        return X_pair
+
     # ------------------------------------------------------------------
     # PBOAgent interface
     # ------------------------------------------------------------------
@@ -308,6 +336,7 @@ class QEUBOAgent(PBOAgent):
 
         model = self._fit_model(comparisons)
         X_next = self._optimize_qeubo_continuous(model, candidate_pool)
+        X_next = self._ensure_distinct_pair(X_next, candidate_pool)
         return candidate_value(X_next[0]), candidate_value(X_next[1])
 
     def recommend(
@@ -358,6 +387,7 @@ class QEIAgent(QEUBOAgent):
         model = self._fit_model(comparisons)
         acqf = self._make_qei_acqf(model)
         X_next = self._optimize_acqf_continuous(acqf, candidate_pool, q=2)
+        X_next = self._ensure_distinct_pair(X_next, candidate_pool)
         return candidate_value(X_next[0]), candidate_value(X_next[1])
 
 
@@ -389,6 +419,7 @@ class QNEIAgent(QEUBOAgent):
         model = self._fit_model(comparisons)
         acqf = self._make_qnei_acqf(model)
         X_next = self._optimize_acqf_continuous(acqf, candidate_pool, q=2)
+        X_next = self._ensure_distinct_pair(X_next, candidate_pool)
         return candidate_value(X_next[0]), candidate_value(X_next[1])
 
 
@@ -429,4 +460,5 @@ class QTSAgent(QEUBOAgent):
             ],
             dim=0,
         )
+        X_next = self._ensure_distinct_pair(X_next, candidate_pool)
         return candidate_value(X_next[0]), candidate_value(X_next[1])
