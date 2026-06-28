@@ -2,8 +2,9 @@
 qEUBO-агент (Astudillo & Frazier 2023).
 
 Модель: PairwiseGP с RBF-ядром и probit likelihood из BoTorch.
-Выбор пары: qExpectedUtilityOfBestOption, оптимизированная непрерывно на [0, 1]^d.
-Рекомендация: максимум posterior mean по непрерывной области.
+Выбор пары: qExpectedUtilityOfBestOption, оптимизированная по дискретному
+candidate_pool или непрерывно на [0, 1]^d.
+Рекомендация: максимум posterior mean по candidate_pool или непрерывной области.
 
 Требуется: pip install botorch
 """
@@ -25,7 +26,7 @@ try:
     from botorch.acquisition import qNoisyExpectedImprovement
     from botorch.acquisition.monte_carlo import qExpectedImprovement
     from botorch.generation import MaxPosteriorSampling
-    from botorch.optim import optimize_acqf
+    from botorch.optim import optimize_acqf, optimize_acqf_discrete
     from botorch.fit import fit_gpytorch_mll
     from botorch.sampling.normal import SobolQMCNormalSampler
     from botorch.utils.sampling import draw_sobol_samples
@@ -51,6 +52,7 @@ def _require_botorch():
 def _build_pairwise_tensors(
     comparisons: list[Comparison],
     dtype=torch.float64,
+    device=None,
 ) -> tuple[Tensor, Tensor]:
     """
     Преобразует историю сравнений в формат `PairwiseGP`.
@@ -66,8 +68,8 @@ def _build_pairwise_tensors(
     """
     def key(point):
         """Делает из точки hashable tuple-ключ с фиксированным dtype."""
-        tensor = torch.as_tensor(point, dtype=dtype).reshape(-1)
-        return tuple(float(v) for v in tensor.tolist())
+        tensor = torch.as_tensor(point, dtype=dtype, device=device).reshape(-1)
+        return tuple(float(v) for v in tensor.detach().cpu().tolist())
 
     seen: dict[tuple[float, ...], int] = {}
     for w, l in comparisons:
@@ -81,11 +83,13 @@ def _build_pairwise_tensors(
     datapoints = torch.tensor(
         sorted(seen.keys(), key=lambda x: seen[x]),
         dtype=dtype,
+        device=device,
     )  # (n, d)
 
     comp_idx = torch.tensor(
         [[seen[key(w)], seen[key(l)]] for w, l in comparisons],
         dtype=torch.long,
+        device=device,
     )  # (m, 2)
 
     return datapoints, comp_idx
@@ -99,13 +103,16 @@ class QEUBOAgent(PBOAgent):
     """
     qEUBO baseline поверх BoTorch `PairwiseGP`.
 
-    qEUBO и posterior mean оптимизируются непрерывно на области `[0, 1]^d`.
+    qEUBO и posterior mean оптимизируются либо на дискретном `candidate_pool`,
+    либо непрерывно на области `[0, 1]^d`.
 
     Args:
         fit_hyperparams: Оптимизировать ли GP hyperparameters на каждом шаге.
         max_fit_iter: Максимум итераций для fit hyperparameters.
         num_acqf_samples: Число MC-сэмплов для оценки qEUBO.
         dtype: dtype для GP-тензоров; для GP обычно устойчивее `float64`.
+        device: Устройство для BoTorch/GPyTorch тензоров.
+        support: `"grid"` или `"continuous_rff"`.
         continuous_num_restarts: Число рестартов для `optimize_acqf`.
         continuous_raw_samples: Число raw samples для выбора стартов optimizer.
         continuous_maxiter: Максимум итераций continuous optimizer.
@@ -121,6 +128,8 @@ class QEUBOAgent(PBOAgent):
         max_fit_iter: int = 100,
         num_acqf_samples: int = 512,
         dtype=torch.float64,
+        device: str | torch.device = "cpu",
+        support: str = "grid",
         continuous_num_restarts: int = 10,  # число стартов для optimize_acqf
         continuous_raw_samples: int = 256, # число raw samples для выбора стартовых точек
         continuous_maxiter: int = 100, # лимит итераций optimizer.
@@ -129,7 +138,7 @@ class QEUBOAgent(PBOAgent):
         gp_lengthscale: float | None = None,
         gp_outputscale: float | None = None,
     ):
-        """Инициализирует qEUBO-агента и параметры continuous оптимизации."""
+        """Инициализирует qEUBO-агента и параметры grid/continuous оптимизации."""
         _require_botorch()
         self.fit_hyperparams = fit_hyperparams
         self.max_fit_iter = max_fit_iter
@@ -142,6 +151,8 @@ class QEUBOAgent(PBOAgent):
         self.gp_outputscale = None if gp_outputscale is None else float(gp_outputscale)
         self.num_acqf_samples = num_acqf_samples
         self.dtype = dtype
+        self.device = torch.device(device)
+        self.support = support
         self.continuous_num_restarts = int(continuous_num_restarts)
         self.continuous_raw_samples = int(continuous_raw_samples)
         self.continuous_maxiter = int(continuous_maxiter)
@@ -158,9 +169,13 @@ class QEUBOAgent(PBOAgent):
         Важный момент для continuous режима: модель фитится только на реальных
         точках из `comparisons`, а не на текущем `candidate_pool`.
         """
-        datapoints, comp_idx = _build_pairwise_tensors(comparisons, dtype=self.dtype)
+        datapoints, comp_idx = _build_pairwise_tensors(
+            comparisons,
+            dtype=self.dtype,
+            device=self.device,
+        )
 
-        model = PairwiseGP(datapoints, comp_idx)
+        model = PairwiseGP(datapoints, comp_idx).to(self.device)
         model.train()
 
         if self.fit_hyperparams:
@@ -197,6 +212,13 @@ class QEUBOAgent(PBOAgent):
         transformed_dp = model.transform_inputs(model.datapoints)
         model._update(transformed_dp)
 
+    def _posterior_mean(self, model: "PairwiseGP", candidate_pool: Tensor) -> Tensor:
+        """Computes posterior mean at every point in the candidate pool."""
+        X = candidate_matrix(candidate_pool, dtype=self.dtype, device=self.device)
+        with torch.no_grad():
+            posterior = model.posterior(X)
+        return posterior.mean.squeeze(-1).squeeze(-1)
+
     def _bounds_from_pool(self, candidate_pool: Tensor) -> Tensor:
         """
         Строит bounds `[0, 1]^d` для continuous optimizer.
@@ -204,7 +226,7 @@ class QEUBOAgent(PBOAgent):
         Размерность `d` берется из формы `candidate_pool`, чтобы не добавлять
         отдельный параметр `input_dim` в интерфейс агента.
         """
-        X = candidate_matrix(candidate_pool, dtype=self.dtype)
+        X = candidate_matrix(candidate_pool, dtype=self.dtype, device=self.device)
         input_dim = X.shape[-1]
         return torch.stack(
             [
@@ -248,6 +270,23 @@ class QEUBOAgent(PBOAgent):
             num_restarts=self.continuous_num_restarts,
             raw_samples=self.continuous_raw_samples,
             options={"maxiter": self.continuous_maxiter},
+        )
+        return X_next.detach()
+
+    def _optimize_acqf_grid(
+        self,
+        acqf,
+        candidate_pool: Tensor,
+        *,
+        q: int,
+    ) -> Tensor:
+        """Optimizes an acquisition function over the finite candidate pool."""
+        choices = candidate_matrix(candidate_pool, dtype=self.dtype, device=self.device)
+        X_next, _ = optimize_acqf_discrete(
+            acq_function=acqf,
+            q=q,
+            choices=choices,
+            unique=True,
         )
         return X_next.detach()
 
@@ -332,17 +371,26 @@ class QEUBOAgent(PBOAgent):
         """
         Возвращает следующую пару точек для сравнения.
 
-        Оптимизирует qEUBO напрямую на `[0, 1]^d`. Если истории сравнений
-        еще нет, возвращает случайную пару из `candidate_pool`.
+        В grid режиме оптимизирует qEUBO по `candidate_pool`. В continuous
+        режиме оптимизирует qEUBO напрямую на `[0, 1]^d`.
         """
         if not comparisons:
             idx = torch.randperm(len(candidate_pool))[:2]
             return candidate_value(candidate_pool[idx[0]]), candidate_value(candidate_pool[idx[1]])
 
         model = self._fit_model(comparisons)
-        X_next = self._optimize_qeubo_continuous(model, candidate_pool)
-        X_next = self._ensure_distinct_pair(X_next, candidate_pool)
-        return candidate_value(X_next[0]), candidate_value(X_next[1])
+
+        if self.support == "grid":
+            acqf = self._make_qeubo_acqf(model)
+            X_next = self._optimize_acqf_grid(acqf, candidate_pool, q=2)
+            return candidate_value(X_next[0]), candidate_value(X_next[1])
+
+        if self.support == "continuous_rff":
+            X_next = self._optimize_qeubo_continuous(model, candidate_pool)
+            X_next = self._ensure_distinct_pair(X_next, candidate_pool)
+            return candidate_value(X_next[0]), candidate_value(X_next[1])
+
+        raise ValueError(f"Unknown QEUBOAgent support {self.support!r}.")
 
     def recommend(
         self,
@@ -352,14 +400,23 @@ class QEUBOAgent(PBOAgent):
         """
         Возвращает текущую рекомендацию лучшей точки.
 
-        Оптимизирует posterior mean на `[0, 1]^d`.
+        В grid режиме выбирает argmax posterior mean среди `candidate_pool`.
+        В continuous режиме оптимизирует posterior mean на `[0, 1]^d`.
         """
         if not comparisons:
             return candidate_value(candidate_pool[len(candidate_pool) // 2])
 
         model = self._fit_model(comparisons)
-        X_best = self._optimize_mean_continuous(model, candidate_pool)
-        return candidate_value(X_best)
+
+        if self.support == "grid":
+            mean = self._posterior_mean(model, candidate_pool)
+            return candidate_value(candidate_pool[mean.argmax()])
+
+        if self.support == "continuous_rff":
+            X_best = self._optimize_mean_continuous(model, candidate_pool)
+            return candidate_value(X_best)
+
+        raise ValueError(f"Unknown QEUBOAgent support {self.support!r}.")
 
 
 class QEIAgent(QEUBOAgent):
@@ -384,16 +441,23 @@ class QEIAgent(QEUBOAgent):
         comparisons: list[Comparison],
         candidate_pool: Tensor,
     ) -> tuple[Point, Point]:
-        """Возвращает пару, выбранную continuous qEI acquisition."""
+        """Возвращает пару, выбранную qEI acquisition."""
         if not comparisons:
             idx = torch.randperm(len(candidate_pool))[:2]
             return candidate_value(candidate_pool[idx[0]]), candidate_value(candidate_pool[idx[1]])
 
         model = self._fit_model(comparisons)
         acqf = self._make_qei_acqf(model)
-        X_next = self._optimize_acqf_continuous(acqf, candidate_pool, q=2)
-        X_next = self._ensure_distinct_pair(X_next, candidate_pool)
-        return candidate_value(X_next[0]), candidate_value(X_next[1])
+        if self.support == "grid":
+            X_next = self._optimize_acqf_grid(acqf, candidate_pool, q=2)
+            return candidate_value(X_next[0]), candidate_value(X_next[1])
+
+        if self.support == "continuous_rff":
+            X_next = self._optimize_acqf_continuous(acqf, candidate_pool, q=2)
+            X_next = self._ensure_distinct_pair(X_next, candidate_pool)
+            return candidate_value(X_next[0]), candidate_value(X_next[1])
+
+        raise ValueError(f"Unknown QEIAgent support {self.support!r}.")
 
 
 class QNEIAgent(QEUBOAgent):
@@ -416,16 +480,23 @@ class QNEIAgent(QEUBOAgent):
         comparisons: list[Comparison],
         candidate_pool: Tensor,
     ) -> tuple[Point, Point]:
-        """Возвращает пару, выбранную continuous qNEI acquisition."""
+        """Возвращает пару, выбранную qNEI acquisition."""
         if not comparisons:
             idx = torch.randperm(len(candidate_pool))[:2]
             return candidate_value(candidate_pool[idx[0]]), candidate_value(candidate_pool[idx[1]])
 
         model = self._fit_model(comparisons)
         acqf = self._make_qnei_acqf(model)
-        X_next = self._optimize_acqf_continuous(acqf, candidate_pool, q=2)
-        X_next = self._ensure_distinct_pair(X_next, candidate_pool)
-        return candidate_value(X_next[0]), candidate_value(X_next[1])
+        if self.support == "grid":
+            X_next = self._optimize_acqf_grid(acqf, candidate_pool, q=2)
+            return candidate_value(X_next[0]), candidate_value(X_next[1])
+
+        if self.support == "continuous_rff":
+            X_next = self._optimize_acqf_continuous(acqf, candidate_pool, q=2)
+            X_next = self._ensure_distinct_pair(X_next, candidate_pool)
+            return candidate_value(X_next[0]), candidate_value(X_next[1])
+
+        raise ValueError(f"Unknown QNEIAgent support {self.support!r}.")
 
 
 class QTSAgent(QEUBOAgent):
@@ -451,12 +522,21 @@ class QTSAgent(QEUBOAgent):
         comparisons: list[Comparison],
         candidate_pool: Tensor,
     ) -> tuple[Point, Point]:
-        """Возвращает пару, выбранную continuous Thompson sampling."""
+        """Возвращает пару, выбранную Thompson sampling."""
         if not comparisons:
             idx = torch.randperm(len(candidate_pool))[:2]
             return candidate_value(candidate_pool[idx[0]]), candidate_value(candidate_pool[idx[1]])
 
         model = self._fit_model(comparisons)
+        if self.support == "grid":
+            choices = candidate_matrix(candidate_pool, dtype=self.dtype, device=self.device)
+            thompson_sampling = MaxPosteriorSampling(model=model, replacement=False)
+            X_next = thompson_sampling(choices, num_samples=2)
+            return candidate_value(X_next[0]), candidate_value(X_next[1])
+
+        if self.support != "continuous_rff":
+            raise ValueError(f"Unknown QTSAgent support {self.support!r}.")
+
         bounds = self._bounds_from_pool(candidate_pool)
         X_next = torch.cat(
             [

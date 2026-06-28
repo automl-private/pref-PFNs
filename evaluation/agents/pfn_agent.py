@@ -1,25 +1,24 @@
 """
 PFN-based preference BO agent.
 
-Uses the trained preference PFN model to:
-  - recommend: argmax of diagonal pair-score over a continuous candidate pool
-  - suggest_pair: shortlist/rerank pair scores on a continuous candidate pool
+Uses the trained preference PFN model to score candidate pairs.
 """
 
 from __future__ import annotations
 
 import torch
 
-from .base import PBOAgent, Comparison, Point, candidate_value
+from .base import PBOAgent, Comparison, Point, candidate_matrix, candidate_value
 
 try:
     from botorch.acquisition.acquisition import AcquisitionFunction as _PBOAcquisitionFunction
-    from botorch.optim import optimize_acqf
+    from botorch.optim import optimize_acqf, optimize_acqf_discrete
 
     _BOTORCH_AVAILABLE = True
 except ImportError:
     _PBOAcquisitionFunction = torch.nn.Module
     optimize_acqf = None
+    optimize_acqf_discrete = None
     _BOTORCH_AVAILABLE = False
 
 
@@ -47,9 +46,9 @@ class PairScorePFNAgent(PBOAgent):
     """
     PFN-агент для checkpoint'ов, которые напрямую скорят пару точек.
 
-    Работает как batched candidate-set optimizer: сначала скорит диагональ
-    `(x, x)` на большом continuous pool, затем rerank'ит полный набор пар
-    только на shortlist из top-k и exploration-точек.
+    В grid режиме считает полную матрицу pair-score'ов на `candidate_pool`.
+    В continuous режиме сначала скорит диагональ `(x, x)` на большом pool,
+    затем rerank'ит полный набор пар только на shortlist.
     """
 
     def __init__(
@@ -59,6 +58,7 @@ class PairScorePFNAgent(PBOAgent):
         device: str,
         pair_batch_size: int,
         input_dim: int,
+        support: str = "grid",
         continuous_top_k: int = 64,
         continuous_explore_k: int = 64,
     ) -> None:
@@ -71,6 +71,8 @@ class PairScorePFNAgent(PBOAgent):
             pair_batch_size: Сколько пар отправлять в PFN за один batch.
             input_dim: Размерность одной точки; вход пары имеет размер
                 `2 * input_dim`.
+            support: `"grid"` для полного перебора или `"continuous_rff"` для
+                shortlist/reranking по sampled continuous pool.
             continuous_top_k: Сколько лучших точек по диагональному score
                 брать в shortlist.
             continuous_explore_k: Сколько случайных exploration-точек добавлять
@@ -82,6 +84,7 @@ class PairScorePFNAgent(PBOAgent):
         self.criterion = model.criterion
         self.pair_batch_size = int(pair_batch_size)
         self.input_dim = int(input_dim)
+        self.support = support
         self.continuous_top_k = int(continuous_top_k)
         self.continuous_explore_k = int(continuous_explore_k)
 
@@ -225,15 +228,21 @@ class PairScorePFNAgent(PBOAgent):
         """
         Выбирает следующую пару для oracle comparison.
 
-        Сначала строит shortlist, затем скорит все пары внутри него и
-        возвращает лучшую недиагональную пару.
+        В grid режиме скорит все пары на сетке. В continuous режиме сначала
+        строит shortlist, затем скорит все пары внутри него.
         """
         if not comparisons:
             idx = torch.randperm(len(candidate_pool))[:2]
             return candidate_value(candidate_pool[idx[0]]), candidate_value(candidate_pool[idx[1]])
 
-        pool = self._continuous_shortlist(comparisons, candidate_pool)
-        scores = self._pair_scores(comparisons, pool)
+        if self.support == "grid":
+            pool = candidate_pool
+            scores = self._pair_scores(comparisons, pool)
+        elif self.support == "continuous_rff":
+            pool = self._continuous_shortlist(comparisons, candidate_pool)
+            scores = self._pair_scores(comparisons, pool)
+        else:
+            raise ValueError(f"Unknown PairScorePFNAgent support {self.support!r}.")
 
         # scores[i, j] ≈ E[max(f(x_i), f(x_j)) | comparisons]
         # scores[i, j] ≈ E[max(f(x_i), f(x_j)) - f* | comparisons]
@@ -255,14 +264,22 @@ class PairScorePFNAgent(PBOAgent):
         """
         Возвращает текущую рекомендацию лучшей точки.
 
-        Скорит только диагональ `(x, x)` на большом `candidate_pool` и
-        возвращает argmax.
+        В grid режиме берет диагональ полной pair-score матрицы. В continuous
+        режиме скорит только диагональные пары `(x, x)`.
         """
         if not comparisons:
             return candidate_value(candidate_pool[candidate_pool.shape[0] // 2])
 
-        diag = self._diag_scores(comparisons, candidate_pool)
-        return candidate_value(candidate_pool[diag.argmax()])
+        if self.support == "grid":
+            scores = self._pair_scores(comparisons, candidate_pool)
+            diag = torch.diagonal(scores)
+            return candidate_value(candidate_pool[diag.argmax()])
+
+        if self.support == "continuous_rff":
+            diag = self._diag_scores(comparisons, candidate_pool)
+            return candidate_value(candidate_pool[diag.argmax()])
+
+        raise ValueError(f"Unknown PairScorePFNAgent support {self.support!r}.")
 
 
 class PBOPFN(_PBOAcquisitionFunction):
@@ -294,6 +311,7 @@ class PBOPFN(_PBOAcquisitionFunction):
         self.input_dim = int(input_dim)
         self._x_ctx: torch.Tensor | None = None
         self._y_ctx: torch.Tensor | None = None
+        self.X_pending = None
 
     @property
     def dtype(self) -> torch.dtype:
@@ -377,7 +395,7 @@ class PBOPFN(_PBOAcquisitionFunction):
 
 class BoTorchPairPFN(PBOAgent):
     """
-    Continuous PBOAgent поверх `PBOPFN`.
+    PBOAgent поверх `PBOPFN`.
 
     Класс только адаптирует BoTorch-оптимизацию обратно к интерфейсу repo:
     `suggest_pair` возвращает две точки, `recommend` возвращает одну точку.
@@ -390,6 +408,7 @@ class BoTorchPairPFN(PBOAgent):
         device: str,
         pair_batch_size: int,
         input_dim: int,
+        support: str = "grid",
         continuous_num_restarts: int = 10,
         continuous_raw_samples: int = 128,
         continuous_maxiter: int = 100,
@@ -404,6 +423,7 @@ class BoTorchPairPFN(PBOAgent):
         self.device = torch.device(device)
         self.pair_batch_size = int(pair_batch_size)
         self.input_dim = int(input_dim)
+        self.support = support
         self.continuous_num_restarts = int(continuous_num_restarts)
         self.continuous_raw_samples = int(continuous_raw_samples)
         self.continuous_maxiter = int(continuous_maxiter)
@@ -442,18 +462,40 @@ class BoTorchPairPFN(PBOAgent):
         )
         return X_best.detach()
 
+    def _optimize_grid(
+        self,
+        acqf: PBOPFN,
+        candidate_pool: torch.Tensor,
+        *,
+        q: int,
+    ) -> torch.Tensor:
+        """Оптимизирует `PBOPFN` только по точкам из `candidate_pool`."""
+        choices = candidate_matrix(candidate_pool, dtype=self.dtype, device=self.device)
+        X_best, _ = optimize_acqf_discrete(
+            acq_function=acqf,
+            q=q,
+            choices=choices,
+            unique=True,
+        )
+        return X_best.detach()
+
     def suggest_pair(
         self,
         comparisons: list[Comparison],
         candidate_pool: torch.Tensor,
     ) -> tuple[Point, Point]:
-        """Возвращает следующую пару из continuous оптимизации pair-score PFN."""
+        """Возвращает следующую пару из grid или continuous оптимизации PFN."""
         if not comparisons:
             idx = torch.randperm(len(candidate_pool))[:2]
             return candidate_value(candidate_pool[idx[0]]), candidate_value(candidate_pool[idx[1]])
 
         acqf = self._make_acqf(comparisons)
-        X_next = self._optimize_continuous(acqf, q=2)
+        if self.support == "grid":
+            X_next = self._optimize_grid(acqf, candidate_pool, q=2)
+        elif self.support == "continuous_rff":
+            X_next = self._optimize_continuous(acqf, q=2)
+        else:
+            raise ValueError(f"Unknown BoTorchPairPFN support {self.support!r}.")
         return candidate_value(X_next[0]), candidate_value(X_next[1])
 
     def recommend(
@@ -461,10 +503,15 @@ class BoTorchPairPFN(PBOAgent):
         comparisons: list[Comparison],
         candidate_pool: torch.Tensor,
     ) -> Point:
-        """Возвращает текущую лучшую точку через continuous оптимизацию `(x, x)`."""
+        """Возвращает текущую лучшую точку через grid или continuous оптимизацию."""
         if not comparisons:
             return candidate_value(candidate_pool[len(candidate_pool) // 2])
 
         acqf = self._make_acqf(comparisons)
-        X_best = self._optimize_continuous(acqf, q=1)[0]
+        if self.support == "grid":
+            X_best = self._optimize_grid(acqf, candidate_pool, q=1)[0]
+        elif self.support == "continuous_rff":
+            X_best = self._optimize_continuous(acqf, q=1)[0] # TODO: make it clear how it works, if it works for pairs
+        else:
+            raise ValueError(f"Unknown BoTorchPairPFN support {self.support!r}.")
         return candidate_value(X_best)

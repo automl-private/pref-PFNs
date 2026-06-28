@@ -1,21 +1,17 @@
-"""
-Random baseline agent.
-
-suggest_pair: samples two random points from the continuous domain [0, 1]^d.
-recommend:    returns the best observed point by true utility, matching PABBO rs.
-"""
+"""Random baseline agent."""
 
 from __future__ import annotations
 
 import random
 import torch
 
-from .base import PBOAgent, Comparison, Point
+from .base import PBOAgent, Comparison, Point, candidate_value
 
 
 class RandomAgent(PBOAgent):
-    def __init__(self, seed: int = 0):
+    def __init__(self, seed: int = 0, support: str = "grid"):
         self._rng = random.Random(seed)
+        self.support = support
         self._best_point: Point | None = None
         self._best_value = -float("inf")
 
@@ -24,7 +20,7 @@ class RandomAgent(PBOAgent):
         self._best_point = None
         self._best_value = -float("inf")
 
-    def _random_point(self, candidate_pool: torch.Tensor) -> Point:
+    def _continuous_random_point(self, candidate_pool: torch.Tensor) -> Point:
         """Samples one uniform point from [0, 1]^d using candidate_pool only for d."""
         candidates = torch.as_tensor(candidate_pool)
         if candidates.ndim == 1:
@@ -34,6 +30,15 @@ class RandomAgent(PBOAgent):
         if input_dim == 1:
             return float(self._rng.random())
         return tuple(float(self._rng.random()) for _ in range(int(input_dim)))
+
+    def _random_point(self, candidate_pool: torch.Tensor) -> Point:
+        """Samples from the finite grid or from the continuous domain."""
+        if self.support == "grid":
+            idx = self._rng.randrange(len(candidate_pool))
+            return candidate_value(candidate_pool[idx])
+        if self.support == "continuous_rff":
+            return self._continuous_random_point(candidate_pool)
+        raise ValueError(f"Unknown RandomAgent support {self.support!r}.")
 
     def observe_pair(self, x1: Point, x2: Point, f1: float, f2: float) -> None:
         """Stores the true best-observed point among all random queries."""
@@ -48,7 +53,7 @@ class RandomAgent(PBOAgent):
         comparisons: list[Comparison],
         candidate_pool: torch.Tensor,
     ) -> tuple[Point, Point]:
-        """Samples two independent random points from [0, 1]^d."""
+        """Samples two independent random points or grid candidates."""
         return self._random_point(candidate_pool), self._random_point(candidate_pool)
 
     def recommend(
