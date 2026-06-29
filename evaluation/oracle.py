@@ -14,7 +14,7 @@ from typing import Dict, List, Optional
 import gpytorch
 import torch
 
-from evaluation.grid_designs import make_1d_grid
+from evaluation.grid_designs import make_unit_grid
 
 
 @dataclass(frozen=True)
@@ -202,24 +202,13 @@ def _make_grid_points(
     grid_design: str,
     grid_seed: int,
 ) -> torch.Tensor:
-    if input_dim == 1:
-        return make_1d_grid(n_grid, design=grid_design, seed=grid_seed, dtype=torch.double)
-
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(int(grid_seed))
-    if grid_design == "lhs":
-        base = torch.arange(n_grid, dtype=torch.double).unsqueeze(-1)
-        offsets = torch.rand(n_grid, input_dim, generator=generator, dtype=torch.double)
-        x_kernel = (base + offsets) / float(n_grid)
-        for dim in range(input_dim):
-            perm = torch.randperm(n_grid, generator=generator)
-            x_kernel[:, dim] = x_kernel[perm, dim]
-        return x_kernel
-
-    if grid_design == "uniform":
-        return torch.rand(n_grid, input_dim, generator=generator, dtype=torch.double)
-
-    raise ValueError(f"Unknown grid design {grid_design!r}.")
+    return make_unit_grid(
+        n_grid,
+        input_dim,
+        design=grid_design,
+        seed=grid_seed,
+        dtype=torch.double,
+    )
 
 
 def sample_gp_function(

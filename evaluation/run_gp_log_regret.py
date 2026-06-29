@@ -46,7 +46,10 @@ from evaluation.agents import (
     RandomAgent,
 )
 from evaluation.agents.base import PBOAgent
-from evaluation.benchmarks_1d import BENCHMARKS_1D, make_benchmark_1d
+from evaluation.benchmarks_1d import (
+    DEFAULT_DETERMINISTIC_BENCHMARKS_BY_DIM,
+    make_benchmark,
+)
 from evaluation.loop import run_bo_loop
 from pfns.run_training_cli import load_config_from_python
 from evaluation.oracle import (
@@ -138,8 +141,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--deterministic-benchmarks",
         nargs="+",
-        default=list(BENCHMARKS_1D.keys()),
-        help="Deterministic 1D benchmark names.",
+        default=None,
+        help="Deterministic benchmark names. Defaults depend on --input-dim.",
     )
     parser.add_argument(
         "--deterministic-normalizations",
@@ -224,6 +227,21 @@ def validate_pfn_args(args: argparse.Namespace, selected_methods: Sequence[str])
             f"Checkpoint name implies input_dim={checkpoint_dim}, "
             f"but --input-dim={args.input_dim}."
         )
+
+
+def deterministic_benchmark_names(args: argparse.Namespace) -> List[str]:
+    if args.deterministic_benchmarks is not None:
+        return list(args.deterministic_benchmarks)
+
+    input_dim = int(args.input_dim)
+    try:
+        return list(DEFAULT_DETERMINISTIC_BENCHMARKS_BY_DIM[input_dim])
+    except KeyError as err:
+        available_dims = ", ".join(str(dim) for dim in DEFAULT_DETERMINISTIC_BENCHMARKS_BY_DIM)
+        raise ValueError(
+            f"No default deterministic benchmarks for input_dim={input_dim}. "
+            f"Available dimensions: {available_dims}."
+        ) from err
 
 
 def make_pfn_spec(
@@ -344,18 +362,17 @@ def build_eval_suite_specs(
             )
 
     if args.benchmark_mode in {"deterministic_only", "all"}:
-        if input_dim != 1:
-            raise ValueError("Deterministic benchmark suites are only defined for input_dim=1.")
         reference_hparams = eval_hparams[0]
         baseline_hparams = GPHyperparameters(
             lengthscale=reference_hparams.lengthscale,
             outputscale=reference_hparams.outputscale,
             noise_std=args.deterministic_noise_std,
         )
-        for benchmark_name in args.deterministic_benchmarks:
+        for benchmark_name in deterministic_benchmark_names(args):
             for normalization in args.deterministic_normalizations:
-                x_grid, f_grid = make_benchmark_1d(
+                x_grid, f_grid = make_benchmark(
                     benchmark_name,
+                    input_dim=input_dim,
                     n_grid=args.n_grid,
                     normalization=normalization,
                     device="cpu",
@@ -372,6 +389,7 @@ def build_eval_suite_specs(
                         benchmark={
                             "kind": "deterministic",
                             "name": benchmark_name,
+                            "input_dim": int(input_dim),
                             "normalization": normalization,
                             "noise_std": float(args.deterministic_noise_std),
                             "reference_hparams": reference_hparams.as_dict(),
@@ -390,12 +408,13 @@ def make_agent_for_method(
     *,
     hparams: GPHyperparameters,
     args: argparse.Namespace,
+    support: str,
     pfn_spec: Optional[PFNSpec],
     pfn_model,
     bo_seed: int,
 ) -> PBOAgent:
     if method_name == "random":
-        return RandomAgent(seed=bo_seed, support=args.gp_support)
+        return RandomAgent(seed=bo_seed, support=support)
     botorch_baselines = {
         "qeubo": QEUBOAgent,
         "qts": QTSAgent,
@@ -411,7 +430,7 @@ def make_agent_for_method(
             gp_outputscale=hparams.outputscale,
             num_acqf_samples=args.qeubo_num_acqf_samples,
             device=args.device,
-            support=args.gp_support,
+            support=support,
             continuous_num_restarts=args.qeubo_continuous_num_restarts,
             continuous_raw_samples=args.qeubo_continuous_raw_samples,
             continuous_maxiter=args.qeubo_continuous_maxiter,
@@ -424,7 +443,7 @@ def make_agent_for_method(
             device=args.device,
             pair_batch_size=args.pfn_pair_batch_size,
             input_dim=pfn_spec.input_dim,
-            support=args.gp_support,
+            support=support,
         )
     if method_name == PFN_BOTORCH_METHOD:
         if pfn_spec is None or pfn_model is None:
@@ -434,7 +453,7 @@ def make_agent_for_method(
             device=args.device,
             pair_batch_size=args.pfn_pair_batch_size,
             input_dim=pfn_spec.input_dim,
-            support=args.gp_support,
+            support=support,
             continuous_num_restarts=args.qeubo_continuous_num_restarts,
             continuous_raw_samples=args.qeubo_continuous_raw_samples,
             continuous_maxiter=args.qeubo_continuous_maxiter,
@@ -551,7 +570,9 @@ def main() -> None:
             "pfn_config": str(args.pfn_config),
             "selected_methods": selected_methods,
             "benchmark_mode": args.benchmark_mode,
-            "deterministic_benchmarks": args.deterministic_benchmarks,
+            "deterministic_benchmarks": deterministic_benchmark_names(args)
+            if args.benchmark_mode in {"deterministic_only", "all"}
+            else None,
             "deterministic_normalizations": args.deterministic_normalizations,
             "deterministic_noise_std": args.deterministic_noise_std,
         },
@@ -572,6 +593,11 @@ def main() -> None:
             n_functions = len(suite_spec.functions)
             simple_regret = torch.empty(n_functions, args.n_bo_seeds, args.budget)
             utility_at_recommendation = torch.empty_like(simple_regret)
+            suite_support = (
+                suite_spec.benchmark.get("support", args.gp_support)
+                if suite_spec.benchmark is not None
+                else args.gp_support
+            )
 
             for function_idx, gp_function in enumerate(suite_spec.functions):
                 for bo_seed in range(args.n_bo_seeds):
@@ -596,6 +622,7 @@ def main() -> None:
                         method_name,
                         hparams=suite_spec.baseline_hparams,
                         args=args,
+                        support=suite_support,
                         pfn_spec=pfn_spec,
                         pfn_model=pfn_model,
                         bo_seed=bo_seed,
