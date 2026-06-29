@@ -47,8 +47,10 @@ from evaluation.agents import (
 )
 from evaluation.agents.base import PBOAgent
 from evaluation.benchmarks_1d import (
+    ContinuousDeterministicBenchmark,
     DEFAULT_DETERMINISTIC_BENCHMARKS_BY_DIM,
     make_benchmark,
+    make_continuous_benchmark,
 )
 from evaluation.loop import run_bo_loop
 from pfns.run_training_cli import load_config_from_python
@@ -370,19 +372,42 @@ def build_eval_suite_specs(
         )
         for benchmark_name in deterministic_benchmark_names(args):
             for normalization in args.deterministic_normalizations:
-                x_grid, f_grid = make_benchmark(
-                    benchmark_name,
-                    input_dim=input_dim,
-                    n_grid=args.n_grid,
-                    normalization=normalization,
-                    device="cpu",
-                    grid_design=args.grid_design,
-                    grid_seed=args.grid_seed_offset,
-                )
+                if args.gp_support == "continuous_rff":
+                    benchmark_function = make_continuous_benchmark(
+                        benchmark_name,
+                        input_dim=input_dim,
+                        normalization=normalization,
+                        reference_size=args.gp_opt_reference_size,
+                        reference_seed=args.grid_seed_offset,
+                        grid_design=args.grid_design,
+                    )
+                    functions = (benchmark_function,)
+                    support = "continuous_rff"
+                    support_metadata = {
+                        "grid_design": args.grid_design,
+                        "reference_size": int(args.gp_opt_reference_size),
+                        "reference_seed": int(args.grid_seed_offset),
+                    }
+                else:
+                    x_grid, f_grid = make_benchmark(
+                        benchmark_name,
+                        input_dim=input_dim,
+                        n_grid=args.n_grid,
+                        normalization=normalization,
+                        device="cpu",
+                        grid_design=args.grid_design,
+                        grid_seed=args.grid_seed_offset,
+                    )
+                    functions = ((x_grid, f_grid),)
+                    support = "grid"
+                    support_metadata = {
+                        "grid_design": args.grid_design,
+                        "grid_seed": int(args.grid_seed_offset),
+                    }
                 suites.append(
                     EvalSuiteSpec(
                         name=f"{benchmark_name}_{normalization}",
-                        functions=((x_grid, f_grid),),
+                        functions=functions,
                         oracle_noise_std=args.deterministic_noise_std,
                         baseline_hparams=baseline_hparams,
                         eval_hparams=None,
@@ -393,9 +418,8 @@ def build_eval_suite_specs(
                             "normalization": normalization,
                             "noise_std": float(args.deterministic_noise_std),
                             "reference_hparams": reference_hparams.as_dict(),
-                            "grid_design": args.grid_design,
-                            "grid_seed": int(args.grid_seed_offset),
-                            "support": "grid",
+                            "support": support,
+                            **support_metadata,
                         },
                     )
                 )
@@ -603,7 +627,10 @@ def main() -> None:
                 for bo_seed in range(args.n_bo_seeds):
                     seed = args.oracle_seed_offset + function_idx * 100_000 + bo_seed
 
-                    if isinstance(gp_function, SampledGPFunction):
+                    if isinstance(
+                        gp_function,
+                        (SampledGPFunction, ContinuousDeterministicBenchmark),
+                    ):
                         oracle = GaussianPreferenceOracle(
                             gp_function=gp_function,
                             noise_std=suite_spec.oracle_noise_std,

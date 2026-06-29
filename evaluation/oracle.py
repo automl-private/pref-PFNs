@@ -42,7 +42,7 @@ class GPHyperparameters:
 @dataclass(frozen=True)
 class EvalSuiteSpec:
     name: str
-    functions: tuple[tuple[torch.Tensor, torch.Tensor] | "SampledGPFunction", ...]
+    functions: tuple[object, ...]
     oracle_noise_std: float
     baseline_hparams: GPHyperparameters
     eval_hparams: Optional[GPHyperparameters]
@@ -88,7 +88,7 @@ class SampledGPFunction:
 
 
 class GaussianPreferenceOracle:
-    """Oracle with Gaussian comparison noise for grid or continuous GP functions."""
+    """Oracle with Gaussian comparison noise for grid or continuous latent functions."""
 
     def __init__(
         self,
@@ -97,7 +97,7 @@ class GaussianPreferenceOracle:
         noise_std: float = 0.0,
         seed: int = 0,
         *,
-        gp_function: Optional[SampledGPFunction] = None,
+        gp_function: Optional[object] = None,
     ) -> None:
         self.noise_std = float(noise_std)
         self.seed = int(seed)
@@ -108,15 +108,17 @@ class GaussianPreferenceOracle:
         if gp_function is not None:
             if x_grid is not None or f_grid is not None:
                 raise ValueError("Pass either gp_function or x_grid/f_grid, not both.")
-            if gp_function.x_opt is None or gp_function.f_opt is None:
-                raise ValueError("SampledGPFunction must contain x_opt and f_opt.")
+            if getattr(gp_function, "x_opt", None) is None:
+                raise ValueError("Continuous latent function must contain x_opt.")
+            if getattr(gp_function, "f_opt", None) is None:
+                raise ValueError("Continuous latent function must contain f_opt.")
 
-            self.support = gp_function.support
-            self.input_dim = int(gp_function.input_dim)
-            self.x_grid = gp_function.x_grid
-            self.f_grid = gp_function.f_grid
-            self._x_opt = gp_function.x_opt
-            self._f_opt = float(gp_function.f_opt)
+            self.support = str(getattr(gp_function, "support"))
+            self.input_dim = int(getattr(gp_function, "input_dim"))
+            self.x_grid = getattr(gp_function, "x_grid", None)
+            self.f_grid = getattr(gp_function, "f_grid", None)
+            self._x_opt = getattr(gp_function, "x_opt")
+            self._f_opt = float(getattr(gp_function, "f_opt"))
             return
 
         if x_grid is None or f_grid is None:

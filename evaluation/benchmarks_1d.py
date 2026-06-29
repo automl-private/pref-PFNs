@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Callable, Mapping
 
 import torch
@@ -11,6 +12,7 @@ from botorch.test_functions.synthetic import (
     Ackley,
     Beale,
     Branin,
+    Griewank,
     Hartmann,
     Levy,
     Powell,
@@ -21,164 +23,104 @@ from botorch.test_functions.synthetic import (
 from evaluation.grid_designs import GridDesign, make_unit_grid
 
 
-BenchmarkFn = Callable[
-    [int, str | torch.device, GridDesign, int],
-    tuple[torch.Tensor, torch.Tensor],
-]
+@dataclass(frozen=True)
+class ContinuousDeterministicBenchmark:
+    name: str
+    input_dim: int
+    norm_mean: float
+    norm_std: float
+    x_opt: object
+    f_opt: float
+    support: str = "continuous_rff"
+
+    def evaluate(self, x, *, batch_size: int = 2048) -> torch.Tensor:
+        x_tensor = torch.as_tensor(x, dtype=torch.float32).reshape(-1, self.input_dim)
+        values = []
+        for start in range(0, x_tensor.shape[0], batch_size):
+            chunk = x_tensor[start : start + batch_size]
+            raw = evaluate_raw_benchmark(self.name, self.input_dim, chunk)
+            values.append((raw - self.norm_mean) / self.norm_std)
+        return torch.cat(values)
 
 
-def forrester_1d(
-    n_grid: int,
-    device: str | torch.device = "cpu",
-    grid_design: GridDesign = "uniform",
-    grid_seed: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    x = make_unit_grid(n_grid, 1, design=grid_design, seed=grid_seed, device=device)
-    f = (6.0 * x - 2.0).square() * torch.sin(12.0 * x - 4.0)
-    return x, f
+def evaluate_raw_benchmark(
+    name: str,
+    input_dim: int,
+    x_unit: torch.Tensor,
+) -> torch.Tensor:
+    benchmarks = BOTORCH_BENCHMARKS_BY_DIM.get(input_dim, {})
+    if name in benchmarks:
+        x = torch.as_tensor(x_unit, dtype=torch.float32).reshape(-1, input_dim)
+        function = benchmarks[name]().to(device=x.device, dtype=x.dtype)
+        bounds = function.bounds.to(device=x.device, dtype=x.dtype)
+        x_domain = bounds[0] + x * (bounds[1] - bounds[0])
+        with torch.no_grad():
+            return function(x_domain).reshape(-1)
+
+    if input_dim != 1:
+        raise ValueError(f"Unknown {input_dim}D deterministic benchmark {name!r}.")
+
+    x = torch.as_tensor(x_unit, dtype=torch.float32).reshape(-1)
+    if name == "forrester_1d":
+        return (6.0 * x - 2.0).square() * torch.sin(12.0 * x - 4.0)
+    if name == "gramacy_lee_1d":
+        z = 0.5 + x * 2.0
+        return torch.sin(10.0 * math.pi * z) / (2.0 * z) + (z - 1.0).pow(4)
+    if name == "higdon_1d":
+        z = x * 20.0
+        left = torch.sin(math.pi * z / 5.0)
+        right = 0.2 * torch.cos(4.0 * math.pi * z / 5.0)
+        return torch.where(z < 10.0, left, right)
+    if name == "schwefel_1d":
+        z = -500.0 + x * 1000.0
+        return -(418.9829 - z * torch.sin(torch.sqrt(z.abs())))
+    if name == "weierstrass_1d":
+        z = -0.5 + x
+        a = 0.5
+        b = 3.0
+        k_max = 20
+        value = torch.zeros_like(z)
+        for k in range(k_max + 1):
+            value = value + (a**k) * torch.cos(2.0 * math.pi * (b**k) * (z + 0.5))
+        constant = sum((a**k) * math.cos(math.pi * (b**k)) for k in range(k_max + 1))
+        return -(value - constant)
+    if name == "branin_slice_1d":
+        function = Branin(negate=True)
+        x1 = -5.0 + x * 15.0
+        x2 = torch.full_like(x1, 7.5)
+        x_domain = torch.stack([x1, x2], dim=-1).reshape(-1, 2)
+        with torch.no_grad():
+            return function.to(device=x.device, dtype=x.dtype)(x_domain).reshape(-1)
+    if name == "sinusoidal_1d":
+        return (
+            torch.sin(6.0 * math.pi * x)
+            + 0.5 * torch.sin(2.0 * math.pi * x)
+            + 0.1 * x
+        )
+    raise ValueError(f"Unknown 1D deterministic benchmark {name!r}.")
 
 
-def gramacy_lee_1d(
-    n_grid: int,
-    device: str | torch.device = "cpu",
-    grid_design: GridDesign = "uniform",
-    grid_seed: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    x = make_unit_grid(n_grid, 1, design=grid_design, seed=grid_seed, device=device)
-    z = 0.5 + x * 2.0
-    f = torch.sin(10.0 * math.pi * z) / (2.0 * z) + (z - 1.0).pow(4)
-    return x, f
-
-
-def higdon_1d(
-    n_grid: int,
-    device: str | torch.device = "cpu",
-    grid_design: GridDesign = "uniform",
-    grid_seed: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    x = make_unit_grid(n_grid, 1, design=grid_design, seed=grid_seed, device=device)
-    z = x * 20.0
-    left = torch.sin(math.pi * z / 5.0)
-    right = 0.2 * torch.cos(4.0 * math.pi * z / 5.0)
-    f = torch.where(z < 10.0, left, right)
-    return x, f
-
-
-def ackley_1d(
-    n_grid: int,
-    device: str | torch.device = "cpu",
-    grid_design: GridDesign = "uniform",
-    grid_seed: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    x = make_unit_grid(n_grid, 1, design=grid_design, seed=grid_seed, device=device)
-    z = -32.768 + x * 65.536
-    objective = -20.0 * torch.exp(-0.2 * z.abs()) - torch.exp(torch.cos(2.0 * math.pi * z))
-    objective = objective + 20.0 + math.e
-    return x, -objective
-
-
-def rastrigin_1d(
-    n_grid: int,
-    device: str | torch.device = "cpu",
-    grid_design: GridDesign = "uniform",
-    grid_seed: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    x = make_unit_grid(n_grid, 1, design=grid_design, seed=grid_seed, device=device)
-    z = -5.12 + x * 10.24
-    objective = 10.0 + z.square() - 10.0 * torch.cos(2.0 * math.pi * z)
-    return x, -objective
-
-
-def griewank_1d(
-    n_grid: int,
-    device: str | torch.device = "cpu",
-    grid_design: GridDesign = "uniform",
-    grid_seed: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    x = make_unit_grid(n_grid, 1, design=grid_design, seed=grid_seed, device=device)
-    z = -600.0 + x * 1200.0
-    objective = 1.0 + z.square() / 4000.0 - torch.cos(z)
-    return x, -objective
-
-
-def schwefel_1d(
-    n_grid: int,
-    device: str | torch.device = "cpu",
-    grid_design: GridDesign = "uniform",
-    grid_seed: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    x = make_unit_grid(n_grid, 1, design=grid_design, seed=grid_seed, device=device)
-    z = -500.0 + x * 1000.0
-    objective = 418.9829 - z * torch.sin(torch.sqrt(z.abs()))
-    return x, -objective
-
-
-def weierstrass_1d(
-    n_grid: int,
-    device: str | torch.device = "cpu",
-    grid_design: GridDesign = "uniform",
-    grid_seed: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    x = make_unit_grid(n_grid, 1, design=grid_design, seed=grid_seed, device=device)
-    z = -0.5 + x
-    a = 0.5
-    b = 3.0
-    k_max = 20
-    f = torch.zeros_like(z)
-    for k in range(k_max + 1):
-        f = f + (a**k) * torch.cos(2.0 * math.pi * (b**k) * (z + 0.5))
-    constant = sum((a**k) * math.cos(math.pi * (b**k)) for k in range(k_max + 1))
-    objective = f - constant
-    return x, -objective
-
-
-def branin_slice_1d(
-    n_grid: int,
-    device: str | torch.device = "cpu",
-    grid_design: GridDesign = "uniform",
-    grid_seed: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    x = make_unit_grid(n_grid, 1, design=grid_design, seed=grid_seed, device=device)
-    x1 = -5.0 + x * 15.0
-    x2 = torch.full_like(x1, 7.5)
-    a = 1.0
-    b = 5.1 / (4.0 * math.pi**2)
-    c = 5.0 / math.pi
-    r = 6.0
-    s = 10.0
-    t = 1.0 / (8.0 * math.pi)
-    objective = a * (x2 - b * x1.square() + c * x1 - r).square()
-    objective = objective + s * (1.0 - t) * torch.cos(x1) + s
-    return x, -objective
-
-
-def sinusoidal_1d(
-    n_grid: int,
-    device: str | torch.device = "cpu",
-    grid_design: GridDesign = "uniform",
-    grid_seed: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    x = make_unit_grid(n_grid, 1, design=grid_design, seed=grid_seed, device=device)
-    f = torch.sin(6.0 * math.pi * x) + 0.5 * torch.sin(2.0 * math.pi * x) + 0.1 * x
-    return x, f
-
-
-BENCHMARKS_1D: Mapping[str, BenchmarkFn] = OrderedDict(
-    [
-        ("forrester_1d", forrester_1d),
-        ("gramacy_lee_1d", gramacy_lee_1d),
-        ("higdon_1d", higdon_1d),
-        ("ackley_1d", ackley_1d),
-        ("rastrigin_1d", rastrigin_1d),
-        ("griewank_1d", griewank_1d),
-        ("schwefel_1d", schwefel_1d),
-        ("weierstrass_1d", weierstrass_1d),
-        ("branin_slice_1d", branin_slice_1d),
-        ("sinusoidal_1d", sinusoidal_1d),
-    ]
+BENCHMARKS_1D = (
+    "forrester_1d",
+    "gramacy_lee_1d",
+    "higdon_1d",
+    "ackley_1d",
+    "rastrigin_1d",
+    "griewank_1d",
+    "schwefel_1d",
+    "weierstrass_1d",
+    "branin_slice_1d",
+    "sinusoidal_1d",
 )
 
 BOTORCH_BENCHMARKS_BY_DIM: Mapping[int, Mapping[str, Callable[[], object]]] = {
+    1: OrderedDict(
+        [
+            ("ackley_1d", lambda: Ackley(dim=1, negate=True)),
+            ("rastrigin_1d", lambda: Rastrigin(dim=1, negate=True)),
+            ("griewank_1d", lambda: Griewank(dim=1, negate=True)),
+        ]
+    ),
     2: OrderedDict(
         [
             ("branin_2d", lambda: Branin(negate=True)),
@@ -209,10 +151,11 @@ BOTORCH_BENCHMARKS_BY_DIM: Mapping[int, Mapping[str, Callable[[], object]]] = {
 }
 
 BENCHMARK_NAMES_BY_DIM: Mapping[int, tuple[str, ...]] = {
-    1: tuple(BENCHMARKS_1D.keys()),
+    1: BENCHMARKS_1D,
     **{
         dim: tuple(benchmarks.keys())
         for dim, benchmarks in BOTORCH_BENCHMARKS_BY_DIM.items()
+        if dim != 1
     },
 }
 
@@ -240,34 +183,19 @@ def make_benchmark(
     grid_seed: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     input_dim = int(input_dim)
-
-    if input_dim == 1:
-        try:
-            fn = BENCHMARKS_1D[name]
-        except KeyError as err:
-            available = ", ".join(BENCHMARKS_1D)
-            raise ValueError(
-                f"Unknown 1D deterministic benchmark {name!r}. Available: {available}"
-            ) from err
-        x_grid, f_grid = fn(n_grid, device, grid_design, grid_seed)
-        return x_grid.float(), normalize_f_grid(f_grid, normalization)
-
-    benchmarks = BOTORCH_BENCHMARKS_BY_DIM.get(input_dim)
-    if benchmarks is None:
+    names = BENCHMARK_NAMES_BY_DIM.get(input_dim)
+    if names is None:
         available_dims = ", ".join(str(dim) for dim in BENCHMARK_NAMES_BY_DIM)
         raise ValueError(
             f"Deterministic benchmarks are not defined for input_dim={input_dim}. "
             f"Available dimensions: {available_dims}."
         )
-
-    try:
-        function = benchmarks[name]().to(device=device, dtype=torch.float32)
-    except KeyError as err:
-        available = ", ".join(benchmarks)
+    if name not in names:
+        available = ", ".join(names)
         raise ValueError(
             f"Unknown {input_dim}D deterministic benchmark {name!r}. "
             f"Available: {available}"
-        ) from err
+        )
 
     x_grid = make_unit_grid(
         n_grid,
@@ -276,12 +204,64 @@ def make_benchmark(
         seed=grid_seed,
         device=device,
     )
-    bounds = function.bounds.to(device=x_grid.device, dtype=x_grid.dtype)
-    x_domain = bounds[0] + x_grid * (bounds[1] - bounds[0])
-
-    with torch.no_grad():
-        f_grid = function(x_domain).reshape(-1)
+    f_grid = evaluate_raw_benchmark(name, input_dim, x_grid)
     return x_grid.float(), normalize_f_grid(f_grid, normalization)
+
+
+def make_continuous_benchmark(
+    name: str,
+    *,
+    input_dim: int,
+    normalization: str,
+    reference_size: int,
+    reference_seed: int,
+    grid_design: GridDesign = "lhs",
+) -> ContinuousDeterministicBenchmark:
+    input_dim = int(input_dim)
+    reference_x = make_unit_grid(
+        reference_size,
+        input_dim,
+        design=grid_design,
+        seed=reference_seed,
+    )
+    raw_reference = evaluate_raw_benchmark(name, input_dim, reference_x)
+
+    if normalization == "raw":
+        norm_mean = 0.0
+        norm_std = 1.0
+    elif normalization == "std1":
+        norm_mean = float(raw_reference.mean().item())
+        norm_std = float(raw_reference.std(unbiased=False).clamp_min(1e-12).item())
+    else:
+        raise ValueError(f"Unknown deterministic normalization mode: {normalization!r}")
+
+    reference_values = (raw_reference - norm_mean) / norm_std
+    best_idx = int(reference_values.argmax().item())
+    best_point = reference_x.reshape(-1, input_dim)[best_idx]
+    if input_dim == 1:
+        x_opt = float(best_point.reshape(-1)[0].item())
+    else:
+        x_opt = tuple(float(v) for v in best_point.reshape(-1).tolist())
+    f_opt = float(reference_values[best_idx].item())
+
+    benchmarks = BOTORCH_BENCHMARKS_BY_DIM.get(input_dim, {})
+    if name in benchmarks:
+        function = benchmarks[name]()
+        exact_optimal_value = getattr(function, "_optimal_value", None)
+        if exact_optimal_value is not None:
+            exact_optimal_value = float(exact_optimal_value)
+            if getattr(function, "negate", False):
+                exact_optimal_value = -exact_optimal_value
+            f_opt = float((exact_optimal_value - norm_mean) / norm_std)
+
+    return ContinuousDeterministicBenchmark(
+        name=name,
+        input_dim=input_dim,
+        norm_mean=norm_mean,
+        norm_std=norm_std,
+        x_opt=x_opt,
+        f_opt=f_opt,
+    )
 
 
 def make_benchmark_1d(
