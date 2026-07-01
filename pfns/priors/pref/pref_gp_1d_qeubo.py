@@ -135,6 +135,8 @@ def get_batch(
         target_y=qeubo,
         single_eval_pos=single_eval_pos,
     )
+# g(x, x')
+# classification whether the 1st element is better or not
 
 
 @dataclass(frozen=True)

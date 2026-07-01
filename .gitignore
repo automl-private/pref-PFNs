@@ -8,6 +8,7 @@ __pycache__/
 .gitignore
 scripts/smoke_gp_log_regret.sh
 logs/
+notebooks/
 
 # C extensions
 *.so

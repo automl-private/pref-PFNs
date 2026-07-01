@@ -26,6 +26,17 @@ import numpy as np
 import torch
 
 
+METHOD_COLORS = {
+    "random": "#4C78A8",
+    "qeubo": "#F58518",
+    "qts": "#54A24B",
+    "qei": "#E45756",
+    "qnei": "#B279A2",
+    "pfn": "#000000",
+    "pfn_botorch": "#9D755D",
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Plot log10(mean simple regret) curves.")
     parser.add_argument("--results", type=Path, default=Path("results/gp_log_regret/results.pt"))
@@ -126,6 +137,7 @@ def plot_suite(
     dpi: int,
     title_prefix: str,
     eps: float,
+    method_colors: Mapping[str, str],
 ) -> None:
     fig, ax = plt.subplots(figsize=(10.5, 6.2))
 
@@ -141,6 +153,7 @@ def plot_suite(
             x,
             y,
             label=display_label(method_name, metadata),
+            color=method_colors.get(method_name),
             linewidth=2.0,
             linestyle=linestyle,
         )[0]
@@ -177,6 +190,7 @@ def plot_all_suites(
     dpi: int,
     title_prefix: str,
     eps: float,
+    method_colors: Mapping[str, str],
 ) -> None:
     suites = results["suites"]
     if len(suites) <= 1:
@@ -200,6 +214,7 @@ def plot_all_suites(
                 x,
                 y,
                 label=display_label(method_name, metadata),
+                color=method_colors.get(method_name),
                 linewidth=1.8,
                 linestyle=linestyle,
             )[0]
@@ -324,6 +339,15 @@ def main() -> None:
     args = parse_args()
     results = torch.load(args.results, map_location="cpu")
     methods = args.methods if args.methods else None
+    fallback_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    method_colors = {}
+    for suite in results["suites"].values():
+        for method_name in suite["methods"]:
+            if methods is not None and method_name not in methods:
+                continue
+            if method_name not in method_colors:
+                fallback = fallback_colors[len(method_colors) % len(fallback_colors)]
+                method_colors[method_name] = METHOD_COLORS.get(method_name, fallback)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     for suite_name, suite in results["suites"].items():
@@ -336,6 +360,7 @@ def main() -> None:
             dpi=args.dpi,
             title_prefix=args.title_prefix,
             eps=args.eps,
+            method_colors=method_colors,
         )
         print(f"[plot] saved {out_path}")
 
@@ -347,6 +372,7 @@ def main() -> None:
         dpi=args.dpi,
         title_prefix=args.title_prefix,
         eps=args.eps,
+        method_colors=method_colors,
     )
     if len(results["suites"]) > 1:
         print(f"[plot] saved {all_path}")
