@@ -14,7 +14,14 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from .base import PBOAgent, Comparison, Point, candidate_matrix, candidate_value
+from .base import (
+    PBOAgent,
+    Comparison,
+    Point,
+    _build_pairwise_tensors,
+    candidate_matrix,
+    candidate_value,
+)
 
 try:
     from botorch.models.pairwise_gp import (
@@ -43,56 +50,6 @@ def _require_botorch():
             "botorch is required for qEUBO agent.\n"
             "Install with:  pip install botorch"
         )
-
-
-# ---------------------------------------------------------------------------
-# Data helpers
-# ---------------------------------------------------------------------------
-
-def _build_pairwise_tensors(
-    comparisons: list[Comparison],
-    dtype=torch.float64,
-    device=None,
-) -> tuple[Tensor, Tensor]:
-    """
-    Преобразует историю сравнений в формат `PairwiseGP`.
-
-    На входе список пар `(winner_x, loser_x)`, где точки могут быть скалярами
-    или многомерными tuple/list/tensor. Функция собирает все уникальные точки
-    в порядке первого появления и кодирует каждое сравнение индексами этих
-    точек.
-
-    Возвращает:
-        datapoints: shape `(n_unique, d)`, все уникальные наблюденные точки.
-        comp_idx: shape `(m, 2)`, индексы `[winner_idx, loser_idx]`.
-    """
-    def key(point):
-        """Делает из точки hashable tuple-ключ с фиксированным dtype."""
-        tensor = torch.as_tensor(point, dtype=dtype, device=device).reshape(-1)
-        return tuple(float(v) for v in tensor.detach().cpu().tolist())
-
-    seen: dict[tuple[float, ...], int] = {}
-    for w, l in comparisons:
-        wk = key(w)
-        lk = key(l)
-        if wk not in seen:
-            seen[wk] = len(seen)
-        if lk not in seen:
-            seen[lk] = len(seen)
-
-    datapoints = torch.tensor(
-        sorted(seen.keys(), key=lambda x: seen[x]),
-        dtype=dtype,
-        device=device,
-    )  # (n, d)
-
-    comp_idx = torch.tensor(
-        [[seen[key(w)], seen[key(l)]] for w, l in comparisons],
-        dtype=torch.long,
-        device=device,
-    )  # (m, 2)
-
-    return datapoints, comp_idx
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +170,13 @@ class QEUBOAgent(PBOAgent):
         model._update(transformed_dp)
 
     def _posterior_mean(self, model: "PairwiseGP", candidate_pool: Tensor) -> Tensor:
-        """Computes posterior mean at every point in the candidate pool."""
+        """
+        Считает posterior mean в точках из `candidate_pool`.
+
+        Для grid и continuous support используется один и тот же путь:
+        сначала точки приводятся к матрице `(M, d)`, затем явно вызывается
+        `model.posterior(X)`.
+        """
         X = candidate_matrix(candidate_pool, dtype=self.dtype, device=self.device)
         with torch.no_grad():
             posterior = model.posterior(X)
@@ -400,23 +363,21 @@ class QEUBOAgent(PBOAgent):
         """
         Возвращает текущую рекомендацию лучшей точки.
 
-        В grid режиме выбирает argmax posterior mean среди `candidate_pool`.
-        В continuous режиме оптимизирует posterior mean на `[0, 1]^d`.
+        В обоих режимах выбирает argmax posterior mean среди текущего
+        `candidate_pool`. Для continuous support этот pool является свежей
+        случайной аппроксимацией непрерывной области.
         """
         if not comparisons:
             return candidate_value(candidate_pool[len(candidate_pool) // 2])
 
         model = self._fit_model(comparisons)
 
-        if self.support == "grid":
-            mean = self._posterior_mean(model, candidate_pool)
-            return candidate_value(candidate_pool[mean.argmax()])
+        if self.support not in {"grid", "continuous_rff"}:
+            raise ValueError(f"Unknown QEUBOAgent support {self.support!r}.")
 
-        if self.support == "continuous_rff":
-            X_best = self._optimize_mean_continuous(model, candidate_pool)
-            return candidate_value(X_best)
-
-        raise ValueError(f"Unknown QEUBOAgent support {self.support!r}.")
+        posterior_mean = self._posterior_mean(model, candidate_pool)
+        best_idx = int(posterior_mean.argmax().item())
+        return candidate_value(candidate_pool[best_idx])
 
 
 class QEIAgent(QEUBOAgent):

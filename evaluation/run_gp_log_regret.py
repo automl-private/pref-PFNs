@@ -5,7 +5,7 @@ Run paper-style log10(simple regret) evaluation on GP preference tasks.
 The GP benchmark hyperparameters come from one explicit PFN config. Baselines
 can run without loading a PFN checkpoint. PFN methods use one explicit
 checkpoint/config pair: "pfn" for `PairScorePFNAgent` and "pfn_botorch" for
-`BoTorchPairPFN`.
+`BoTorchPairPFN`. Hybrid PFN/GP diagnostics use the same checkpoint/config.
 
 The plotted quantity is:
 
@@ -39,6 +39,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from evaluation.agents import (
     BoTorchPairPFN,
     PairScorePFNAgent,
+    PairScorePFNGPIncumbentAgent,
+    PairScorePFNGPRecommendAgent,
     QEIAgent,
     QNEIAgent,
     QEUBOAgent,
@@ -67,7 +69,14 @@ MULTIDIM_CHECKPOINT_RE = re.compile(r"^pref_gp_(\d+)d_(.+)$")
 BASELINE_METHODS = ("random", "qeubo", "qts", "qei", "qnei")
 PFN_METHOD = "pfn"
 PFN_BOTORCH_METHOD = "pfn_botorch"
-PFN_METHODS = (PFN_METHOD, PFN_BOTORCH_METHOD)
+PFN_GP_RECOMMEND_METHOD = "pfn_gp_recommend"
+PFN_GP_INCUMBENT_METHOD = "pfn_gp_incumbent"
+PFN_METHODS = (
+    PFN_METHOD,
+    PFN_BOTORCH_METHOD,
+    PFN_GP_RECOMMEND_METHOD,
+    PFN_GP_INCUMBENT_METHOD,
+)
 VALID_METHODS = BASELINE_METHODS + PFN_METHODS
 
 
@@ -160,7 +169,8 @@ def parse_args() -> argparse.Namespace:
         default=["all"],
         help=(
             "Method names to run, or 'all'. Valid methods: "
-            "random qeubo qts qei qnei pfn pfn_botorch."
+            "random qeubo qts qei qnei pfn pfn_botorch "
+            "pfn_gp_recommend pfn_gp_incumbent."
         ),
     )
     parser.add_argument("--exclude-methods", nargs="*", default=[])
@@ -482,6 +492,34 @@ def make_agent_for_method(
             continuous_raw_samples=args.qeubo_continuous_raw_samples,
             continuous_maxiter=args.qeubo_continuous_maxiter,
         )
+    if method_name == PFN_GP_RECOMMEND_METHOD:
+        if pfn_spec is None or pfn_model is None:
+            raise RuntimeError("PFN+GP recommend method was selected but no PFN checkpoint was loaded.")
+        return PairScorePFNGPRecommendAgent(
+            pfn_model,
+            device=args.device,
+            pair_batch_size=args.pfn_pair_batch_size,
+            input_dim=pfn_spec.input_dim,
+            support=support,
+            gp_fit_hyperparams=args.qeubo_fit_hyperparams,
+            gp_max_fit_iter=args.qeubo_max_fit_iter,
+            gp_lengthscale=hparams.lengthscale,
+            gp_outputscale=hparams.outputscale,
+        )
+    if method_name == PFN_GP_INCUMBENT_METHOD:
+        if pfn_spec is None or pfn_model is None:
+            raise RuntimeError("PFN+GP incumbent method was selected but no PFN checkpoint was loaded.")
+        return PairScorePFNGPIncumbentAgent(
+            pfn_model,
+            device=args.device,
+            pair_batch_size=args.pfn_pair_batch_size,
+            input_dim=pfn_spec.input_dim,
+            support=support,
+            gp_fit_hyperparams=args.qeubo_fit_hyperparams,
+            gp_max_fit_iter=args.qeubo_max_fit_iter,
+            gp_lengthscale=hparams.lengthscale,
+            gp_outputscale=hparams.outputscale,
+        )
     raise ValueError(f"Unknown method {method_name!r}.")
 
 
@@ -519,9 +557,15 @@ def method_metadata(
         raise RuntimeError("PFN metadata requested but no PFN spec was created.")
     spec = pfn_spec
     is_in_domain = False if eval_hparams is None else hparams_equal(spec.train_hparams, eval_hparams)
+    pfn_kinds = {
+        PFN_METHOD: "pair_score_pfn",
+        PFN_BOTORCH_METHOD: "botorch_pair_pfn",
+        PFN_GP_RECOMMEND_METHOD: "pair_score_pfn_gp_recommend",
+        PFN_GP_INCUMBENT_METHOD: "pair_score_pfn_gp_incumbent",
+    }
     return {
         "method_name": method_name,
-        "kind": "pair_score_pfn" if method_name == PFN_METHOD else "botorch_pair_pfn",
+        "kind": pfn_kinds[method_name],
         "checkpoint": str(spec.checkpoint_path),
         "config": str(spec.config_path),
         "prior_class": spec.prior_class,

@@ -8,15 +8,20 @@ from __future__ import annotations
 
 import torch
 
-from .base import PBOAgent, Comparison, Point, candidate_matrix, candidate_value
+from .base import PBOAgent, Comparison, Point, candidate_matrix, candidate_value, _build_pairwise_tensors
 
 try:
     from botorch.acquisition.acquisition import AcquisitionFunction as _PBOAcquisitionFunction
+    from botorch.fit import fit_gpytorch_mll
+    from botorch.models.pairwise_gp import PairwiseGP, PairwiseLaplaceMarginalLogLikelihood
     from botorch.optim import optimize_acqf, optimize_acqf_discrete
 
     _BOTORCH_AVAILABLE = True
 except ImportError:
     _PBOAcquisitionFunction = torch.nn.Module
+    PairwiseGP = None
+    PairwiseLaplaceMarginalLogLikelihood = None
+    fit_gpytorch_mll = None
     optimize_acqf = None
     optimize_acqf_discrete = None
     _BOTORCH_AVAILABLE = False
@@ -92,18 +97,6 @@ class PairScorePFNAgent(PBOAgent):
     def dtype(self) -> torch.dtype:
         return next(self.model.parameters()).dtype
 
-    def _candidate_matrix(self, candidate_pool: torch.Tensor) -> torch.Tensor:
-        """
-        Приводит candidate pool к матрице shape `(M, input_dim)`.
-
-        Для одномерного pool shape `(M,)` добавляет последнюю размерность, а для
-        многомерного pool сохраняет первую размерность как число кандидатов.
-        """
-        x = candidate_pool.to(dtype=self.dtype, device=self.device)
-        if x.ndim == 1:
-            return x.unsqueeze(-1)
-        return x.reshape(x.shape[0], -1)
-
     def _score_pair_tensor(
         self,
         comparisons: list[Comparison],
@@ -155,7 +148,7 @@ class PairScorePFNAgent(PBOAgent):
         `recommend` берет argmax этих score'ов, а `suggest_pair` использует их
         для отбора shortlist перед полным pairwise reranking.
         """
-        x = self._candidate_matrix(candidate_pool)
+        x = candidate_matrix(candidate_pool, dtype=self.dtype, device=self.device)
         pairs = torch.cat([x, x], dim=-1)
         return self._score_pair_tensor(comparisons, pairs)
 
@@ -170,7 +163,7 @@ class PairScorePFNAgent(PBOAgent):
         Возвращает `scores` shape `(M, M)`, где `scores[i, j]` соответствует
         PFN-score пары `(candidate_pool[i], candidate_pool[j])`.
         """
-        x = self._candidate_matrix(candidate_pool)
+        x = candidate_matrix(candidate_pool, dtype=self.dtype, device=self.device)
         M = x.shape[0]
         x1 = x.repeat_interleave(M, dim=0)
         x2 = x.repeat(M, 1)
@@ -280,6 +273,166 @@ class PairScorePFNAgent(PBOAgent):
             return candidate_value(candidate_pool[diag.argmax()])
 
         raise ValueError(f"Unknown PairScorePFNAgent support {self.support!r}.")
+
+
+class PairScorePFNGPRecommendAgent(PairScorePFNAgent):
+    """
+    Pair-score PFN для выбора пары и PairwiseGP для рекомендации точки.
+
+    `suggest_pair` наследуется от `PairScorePFNAgent`: PFN свободно выбирает
+    обе точки пары. `recommend` заменяет diagonal score на argmax posterior
+    mean из `PairwiseGP`, обученного только на winner/loser comparisons.
+    """
+
+    def __init__(
+        self,
+        model,
+        *,
+        device: str,
+        pair_batch_size: int,
+        input_dim: int,
+        support: str = "grid",
+        continuous_top_k: int = 64,
+        continuous_explore_k: int = 64,
+        gp_fit_hyperparams: bool = False,
+        gp_max_fit_iter: int = 100,
+        gp_lengthscale: float | None = None,
+        gp_outputscale: float | None = None,
+    ) -> None:
+        """Инициализирует PFN acquisition и GP recommendation model."""
+        if not _BOTORCH_AVAILABLE:
+            raise ImportError("botorch is required for PairScorePFNGPRecommendAgent.")
+        if not gp_fit_hyperparams and (gp_lengthscale is None or gp_outputscale is None):
+            raise ValueError(
+                "PairScorePFNGPRecommendAgent requires gp_lengthscale and "
+                "gp_outputscale when gp_fit_hyperparams=False."
+            )
+        super().__init__(
+            model,
+            device=device,
+            pair_batch_size=pair_batch_size,
+            input_dim=input_dim,
+            support=support,
+            continuous_top_k=continuous_top_k,
+            continuous_explore_k=continuous_explore_k,
+        )
+        self.gp_fit_hyperparams = bool(gp_fit_hyperparams)
+        self.gp_max_fit_iter = int(gp_max_fit_iter)
+        self.gp_lengthscale = None if gp_lengthscale is None else float(gp_lengthscale)
+        self.gp_outputscale = None if gp_outputscale is None else float(gp_outputscale)
+        self.gp_dtype = torch.float64
+
+    def _fit_model(self, comparisons: list[Comparison]) -> "PairwiseGP":
+        """
+        Строит и обучает `PairwiseGP` на уже наблюденных сравнениях.
+
+        Важный момент для continuous режима: модель фитится только на реальных
+        точках из `comparisons`, а не на текущем `candidate_pool`.
+        """
+        datapoints, comp_idx = _build_pairwise_tensors(
+            comparisons,
+            dtype=self.gp_dtype,
+            device=self.device,
+        )
+
+        model = PairwiseGP(datapoints, comp_idx).to(self.device)
+        model.train()
+
+        if self.gp_fit_hyperparams:
+            mll = PairwiseLaplaceMarginalLogLikelihood(model.likelihood, model)
+            fit_gpytorch_mll(mll, max_attempts=1, options={"maxiter": self.gp_max_fit_iter})
+        else:
+            lengthscale = torch.full_like(
+                model.covar_module.base_kernel.lengthscale,
+                self.gp_lengthscale,
+            )
+            model.covar_module.base_kernel.lengthscale = lengthscale
+            model.covar_module.outputscale = torch.as_tensor(
+                self.gp_outputscale,
+                dtype=self.gp_dtype,
+                device=model.datapoints.device,
+            )
+            model._update(model.transform_inputs(model.datapoints))
+
+        model.eval()
+        return model
+
+    def recommend(
+        self,
+        comparisons: list[Comparison],
+        candidate_pool: torch.Tensor,
+    ) -> Point:
+        """Возвращает GP-incumbent вместо PFN diagonal-score recommendation."""
+        if not comparisons:
+            return candidate_value(candidate_pool[candidate_pool.shape[0] // 2])
+
+        gp_model = self._fit_model(comparisons)
+        X = candidate_matrix(candidate_pool, dtype=self.gp_dtype, device=self.device)
+        with torch.no_grad():
+            posterior = gp_model.posterior(X)
+        posterior_mean = posterior.mean.squeeze(-1).squeeze(-1)
+        best_idx = int(posterior_mean.argmax().item())
+        return candidate_value(candidate_pool[best_idx])
+
+
+class PairScorePFNGPIncumbentAgent(PairScorePFNGPRecommendAgent):
+    """
+    GP-incumbent + PFN challenger agent.
+
+    `PairwiseGP` выбирает текущий incumbent как argmax posterior mean.
+    PFN затем выбирает challenger, максимизируя score пары
+    `(incumbent, x)` по текущему `candidate_pool`.
+    """
+
+    def suggest_pair(
+        self,
+        comparisons: list[Comparison],
+        candidate_pool: torch.Tensor,
+    ) -> tuple[Point, Point]:
+        """Возвращает пару `(GP-incumbent, PFN-challenger)`."""
+        # Если истории сравнений еще нет, выбираем две случайные стартовые точки.
+        if not comparisons:
+            # Берем два случайных индекса из текущего candidate pool.
+            idx = torch.randperm(len(candidate_pool))[:2]
+            # Возвращаем сами точки в общем формате Point.
+            return candidate_value(candidate_pool[idx[0]]), candidate_value(candidate_pool[idx[1]])
+
+        # Фитим PairwiseGP на уже наблюденных winner/loser comparisons.
+        gp_model = self._fit_model(comparisons)
+        # Приводим candidate pool к матрице shape (M, d) на нужном dtype/device.
+        X = candidate_matrix(candidate_pool, dtype=self.gp_dtype, device=self.device)
+        # Считаем GP posterior в каждой точке candidate pool.
+        with torch.no_grad():
+            posterior = gp_model.posterior(X)
+        # Достаем posterior mean как vector shape (M,).
+        posterior_mean = posterior.mean.squeeze(-1).squeeze(-1)
+        # Incumbent - точка с максимальным GP posterior mean.
+        incumbent_idx = int(posterior_mean.argmax().item())
+        # Берем incumbent как матрицу shape (1, d), чтобы потом размножить его.
+        incumbent = candidate_matrix(
+            candidate_pool[incumbent_idx : incumbent_idx + 1],
+            dtype=self.dtype,
+            device=self.device,
+        )
+        # Приводим весь candidate pool к матрице shape (M, d) для PFN.
+        candidates = candidate_matrix(candidate_pool, dtype=self.dtype, device=self.device)
+        # Строим M пар вида (incumbent, candidate_i), каждая строка имеет shape (2d,).
+        pairs = torch.cat([incumbent.expand(candidates.shape[0], -1), candidates], dim=-1)
+        # Скорим все пары через PFN и клонируем tensor, потому что дальше маскируем значения inplace.
+        scores = self._score_pair_tensor(comparisons, pairs).clone()
+
+        # Считаем расстояния от каждого candidate_i до incumbent.
+        distances = torch.linalg.norm((candidates - incumbent).detach().cpu(), dim=-1)
+        # Запрещаем выбирать сам incumbent как challenger.
+        scores[distances <= 1e-12] = -torch.inf
+        # Если все кандидаты совпали с incumbent, берем любую другую позицию по индексу.
+        if not torch.isfinite(scores).any():
+            challenger_idx = 1 if incumbent_idx == 0 else 0
+        else:
+            # Иначе challenger - candidate с максимальным PFN score пары (incumbent, candidate).
+            challenger_idx = int(scores.argmax().item())
+        # Возвращаем пару: текущий GP-incumbent и выбранный PFN-challenger.
+        return candidate_value(candidate_pool[incumbent_idx]), candidate_value(candidate_pool[challenger_idx])
 
 
 class PBOPFN(_PBOAcquisitionFunction):
