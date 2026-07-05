@@ -59,6 +59,3 @@ class PBOAgent(ABC):
 
     def reset(self):
         """Optional: clear any cached state between runs."""
-
-    def observe_pair(self, x1: Point, x2: Point, f1: float, f2: float) -> None:
-        """Optional: observe true utilities for the two queried points."""
