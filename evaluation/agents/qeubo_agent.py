@@ -322,10 +322,6 @@ class QEUBOAgent(PBOAgent):
         X_pair[1] = challenger
         return X_pair
 
-    # ------------------------------------------------------------------
-    # PBOAgent interface
-    # ------------------------------------------------------------------
-
     def suggest_pair(
         self,
         comparisons: list[Comparison],

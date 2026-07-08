@@ -1,6 +1,5 @@
 from dataclasses import dataclass
 from functools import partial
-import math
 
 import gpytorch
 import torch
@@ -10,6 +9,7 @@ from pfns.priors.prior import PriorConfig
 
 torch.set_default_dtype(torch.double)
 
+
 def make_gp_prior(
     X,
     lengthscale,
@@ -17,10 +17,12 @@ def make_gp_prior(
     mean_constant=0.0,
     jitter=1e-6,
 ):
+    """Builds an RBF GP prior with fixed hyperparameters."""
     mean_module = gpytorch.means.ConstantMean()
     mean_module.initialize(constant=mean_constant)
 
-    base_kernel = gpytorch.kernels.RBFKernel()
+    gp_dim = X.shape[-1]
+    base_kernel = gpytorch.kernels.RBFKernel(ard_num_dims=gp_dim)
     base_kernel.lengthscale = lengthscale
 
     covar_module = gpytorch.kernels.ScaleKernel(base_kernel)
@@ -40,6 +42,7 @@ def sample_gp_batch(
     noise_std=None,
     jitter=1e-6,
 ):
+    """Samples latent GP utilities and noisy observed utilities."""
     with torch.no_grad():
         f_dist = make_gp_prior(
             X,
@@ -48,7 +51,6 @@ def sample_gp_batch(
             mean_constant=mean_constant,
             jitter=jitter,
         )
-
         f = f_dist.rsample()
 
         if noise_std is None:
@@ -59,76 +61,38 @@ def sample_gp_batch(
     return f.detach(), y.detach()
 
 
-def _sample_log_uniform(
-    batch_size: int,
-    low: float,
-    high: float,
-    *,
-    device,
-) -> torch.Tensor:
-    """Samples one positive hyperparameter per batch element."""
-    if low <= 0.0 or high <= 0.0 or low > high:
-        raise ValueError(f"Expected 0 < low <= high, got low={low}, high={high}.")
-    # If X is log-uniformly distributed between a and b, then \(\log(X)\) is uniformly distributed between \(\log(a)\) and \(\log(b)\).
-    log_values = torch.empty(batch_size, device=device).uniform_(math.log(low), math.log(high))
-    return torch.exp(log_values)
-
-
 def get_batch(
     batch_size=2,
     seq_len=100,
-    num_features=2,
+    num_features=3,
     hyperparameters=None,
     device="cpu",
     single_eval_pos=None,
     *,
-    lengthscale_min=0.05,
-    lengthscale_max=1.0,
-    outputscale_min=0.3,
-    outputscale_max=3.0,
+    lengthscale=0.2,
+    outputscale=1.0,
     mean_constant=0.0,
-    noise_std_min=0.01,
-    noise_std_max=0.15,
+    noise_std=0.05,
     jitter=1e-6,
     **kwargs,
 ):
     """
-    Samples pair-score qEUBO tasks from a fully Bayesian GP prior.
+    Samples qEUBO pair-score tasks with signed-difference pair features.
 
-    Each batch element gets its own GP hyperparameters:
-    `lengthscale`, `outputscale`, and preference-observation `noise_std`.
-    The PFN sees only pairwise comparisons and query pairs, not these sampled
-    hyperparameters.
+    Each token is [x_first, x_second, x_first - x_second].
+    Context pairs are ordered as [winner, loser, winner - loser].
+    Query targets are max(F(x_first), F(x_second)).
     """
-    assert num_features % 2 == 0, "Pair features must be concatenated as [x1, x2]."
+    assert num_features % 3 == 0, "Signed-diff tokens must be [x1, x2, x1 - x2]."
     assert single_eval_pos is not None
     assert 0 <= single_eval_pos <= seq_len
 
-    gp_dim = num_features // 2
+    gp_dim = num_features // 3
 
-    # Each token is a pair, so we first sample two original GP inputs per token.
+    # Each token is a pair, so we sample two original GP inputs per token.
     X = torch.rand(batch_size, 2 * seq_len, gp_dim, device=device)
 
-    # Fully Bayesian part: sample one GP hyperparameter set per synthetic task.
-    lengthscale = _sample_log_uniform(
-        batch_size,
-        lengthscale_min,
-        lengthscale_max,
-        device=device,
-    )
-    outputscale = _sample_log_uniform(
-        batch_size,
-        outputscale_min,
-        outputscale_max,
-        device=device,
-    )
-    noise_std = _sample_log_uniform(
-        batch_size,
-        noise_std_min,
-        noise_std_max,
-        device=device,
-    )
-
+    # Fs is the noiseless utility; Ys is the noisy utility used to order context comparisons.
     Fs, Ys = sample_gp_batch(
         X,
         lengthscale=lengthscale,
@@ -138,33 +102,41 @@ def get_batch(
         jitter=jitter,
     )
 
-    # PFN input stores one pair per token as [x_first, x_second].
+    # The model input stores [first point, second point, signed difference].
     new_X = torch.zeros(batch_size, seq_len, num_features, device=device, dtype=X.dtype)
+
+    # Context targets stay zero; query targets are qEUBO-style max utility.
     qeubo = torch.zeros(batch_size, seq_len, device=device, dtype=Fs.dtype)
 
     for t in range(seq_len):
+        # Pair t uses original GP points 2t and 2t+1.
         i0 = 2 * t
         i1 = 2 * t + 1
 
+        # x0 and x1 are candidate points in [0, 1]^d.
         x0 = X[:, i0, :]
         x1 = X[:, i1, :]
 
         if t < single_eval_pos:
-            # Context comparisons are ordered as winner first, loser second.
+            # Context uses noisy preferences and always puts the winner first.
             y0 = Ys[:, i0]
             y1 = Ys[:, i1]
             prefer_x0 = (y0 > y1).unsqueeze(-1)
             first_x = torch.where(prefer_x0, x0, x1)
             second_x = torch.where(prefer_x0, x1, x0)
         else:
-            # Query pairs keep random order; target uses noiseless latent utility.
+            # Query keeps the random pair order and predicts best latent utility in the pair.
             f0 = Fs[:, i0]
             f1 = Fs[:, i1]
             first_x = x0
             second_x = x1
             qeubo[:, t] = torch.maximum(f0, f1)
 
-        new_X[:, t, :] = torch.cat([first_x, second_x], dim=-1)
+        # Signed difference explicitly marks corresponding coordinates and direction.
+        diff_x = first_x - second_x
+
+        # Full token: [x, x', x - x'].
+        new_X[:, t, :] = torch.cat([first_x, second_x, diff_x], dim=-1)
 
     return Batch(
         x=new_X,
@@ -175,25 +147,19 @@ def get_batch(
 
 
 @dataclass(frozen=True)
-class PrefGPqEUBOFullyBayesPriorConfig(PriorConfig):
-    lengthscale_min: float = 0.05
-    lengthscale_max: float = 1.0
-    outputscale_min: float = 0.3
-    outputscale_max: float = 3.0
+class PrefGPqEUBOSignedDiffPriorConfig(PriorConfig):
+    lengthscale: float = 0.2
+    outputscale: float = 1.0
     mean_constant: float = 0.0
-    noise_std_min: float = 0.01
-    noise_std_max: float = 0.15
+    noise_std: float = 0.05
     jitter: float = 1e-6
 
     def create_get_batch_method(self):
         return partial(
             get_batch,
-            lengthscale_min=self.lengthscale_min,
-            lengthscale_max=self.lengthscale_max,
-            outputscale_min=self.outputscale_min,
-            outputscale_max=self.outputscale_max,
+            lengthscale=self.lengthscale,
+            outputscale=self.outputscale,
             mean_constant=self.mean_constant,
-            noise_std_min=self.noise_std_min,
-            noise_std_max=self.noise_std_max,
+            noise_std=self.noise_std,
             jitter=self.jitter,
         )

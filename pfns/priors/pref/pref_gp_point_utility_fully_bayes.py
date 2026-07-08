@@ -59,6 +59,7 @@ def sample_gp_batch(
     return f.detach(), y.detach()
 
 
+
 def _sample_log_uniform(
     batch_size: int,
     low: float,
@@ -66,10 +67,10 @@ def _sample_log_uniform(
     *,
     device,
 ) -> torch.Tensor:
-    """Samples one positive hyperparameter per batch element."""
+    """Samples one positive hyperparameter per synthetic task."""
     if low <= 0.0 or high <= 0.0 or low > high:
         raise ValueError(f"Expected 0 < low <= high, got low={low}, high={high}.")
-    # If X is log-uniformly distributed between a and b, then \(\log(X)\) is uniformly distributed between \(\log(a)\) and \(\log(b)\).
+
     log_values = torch.empty(batch_size, device=device).uniform_(math.log(low), math.log(high))
     return torch.exp(log_values)
 
@@ -93,23 +94,21 @@ def get_batch(
     **kwargs,
 ):
     """
-    Samples pair-score qEUBO tasks from a fully Bayesian GP prior.
+    Samples preference-context tasks with point-utility queries.
 
-    Each batch element gets its own GP hyperparameters:
-    `lengthscale`, `outputscale`, and preference-observation `noise_std`.
-    The PFN sees only pairwise comparisons and query pairs, not these sampled
-    hyperparameters.
+    Context tokens are pairwise comparisons encoded as [winner_x, loser_x].
+    Query tokens contain one point encoded as [x, 0], and the target is f(x).
     """
-    assert num_features % 2 == 0, "Pair features must be concatenated as [x1, x2]."
+    assert num_features % 2 == 0, "Features must store context pairs as [x1, x2]."
     assert single_eval_pos is not None
     assert 0 <= single_eval_pos <= seq_len
 
     gp_dim = num_features // 2
 
-    # Each token is a pair, so we first sample two original GP inputs per token.
-    X = torch.rand(batch_size, 2 * seq_len, gp_dim, device=device)
+    # We need two GP points per context comparison and one GP point per query.
+    X = torch.rand(batch_size, seq_len + single_eval_pos, gp_dim, device=device)
 
-    # Fully Bayesian part: sample one GP hyperparameter set per synthetic task.
+    # Each synthetic task gets its own GP hyperparameters.
     lengthscale = _sample_log_uniform(
         batch_size,
         lengthscale_min,
@@ -138,44 +137,51 @@ def get_batch(
         jitter=jitter,
     )
 
-    # PFN input stores one pair per token as [x_first, x_second].
+    # Token dimension stays 2 * gp_dim for both context pairs and point queries.
     new_X = torch.zeros(batch_size, seq_len, num_features, device=device, dtype=X.dtype)
-    qeubo = torch.zeros(batch_size, seq_len, device=device, dtype=Fs.dtype)
+    observed_utility = torch.zeros(batch_size, seq_len, device=device, dtype=Ys.dtype)
+    latent_utility = torch.zeros(batch_size, seq_len, device=device, dtype=Fs.dtype)
 
-    for t in range(seq_len):
+    # First tokens are preference comparisons: best point first, worst point second.
+    for t in range(single_eval_pos):
         i0 = 2 * t
         i1 = 2 * t + 1
 
         x0 = X[:, i0, :]
         x1 = X[:, i1, :]
+        y0 = Ys[:, i0]
+        y1 = Ys[:, i1]
 
-        if t < single_eval_pos:
-            # Context comparisons are ordered as winner first, loser second.
-            y0 = Ys[:, i0]
-            y1 = Ys[:, i1]
-            prefer_x0 = (y0 > y1).unsqueeze(-1)
-            first_x = torch.where(prefer_x0, x0, x1)
-            second_x = torch.where(prefer_x0, x1, x0)
-        else:
-            # Query pairs keep random order; target uses noiseless latent utility.
-            f0 = Fs[:, i0]
-            f1 = Fs[:, i1]
-            first_x = x0
-            second_x = x1
-            qeubo[:, t] = torch.maximum(f0, f1)
+        prefer_x0 = (y0 > y1).unsqueeze(-1)
+        best_x = torch.where(prefer_x0, x0, x1)
+        worst_x = torch.where(prefer_x0, x1, x0)
 
-        new_X[:, t, :] = torch.cat([first_x, second_x], dim=-1)
+        new_X[:, t, :] = torch.cat([best_x, worst_x], dim=-1)
+
+    # Remaining tokens are point queries: [x, 0] with target f(x).
+    num_queries = seq_len - single_eval_pos
+    if num_queries > 0:
+        src_start = 2 * single_eval_pos
+        src_end = src_start + num_queries
+
+        query_X = X[:, src_start:src_end, :]
+        query_Fs = Fs[:, src_start:src_end]
+        query_Ys = Ys[:, src_start:src_end]
+
+        new_X[:, single_eval_pos:, :gp_dim] = query_X
+        observed_utility[:, single_eval_pos:] = query_Ys
+        latent_utility[:, single_eval_pos:] = query_Fs
 
     return Batch(
         x=new_X,
-        y=qeubo,
-        target_y=qeubo,
+        y=observed_utility,
+        target_y=latent_utility,
         single_eval_pos=single_eval_pos,
     )
 
 
 @dataclass(frozen=True)
-class PrefGPqEUBOFullyBayesPriorConfig(PriorConfig):
+class PrefGPPointUtilityFullyBayesPriorConfig(PriorConfig):
     lengthscale_min: float = 0.05
     lengthscale_max: float = 1.0
     outputscale_min: float = 0.3
