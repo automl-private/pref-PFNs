@@ -17,13 +17,43 @@ def make_gp_prior(
     mean_constant=0.0,
     jitter=1e-6,
 ):
-    mean_module = gpytorch.means.ConstantMean()
-    mean_module.initialize(constant=mean_constant)
+    batch_size = X.shape[0]
+    gp_dim = X.shape[-1]
 
-    base_kernel = gpytorch.kernels.RBFKernel()
-    base_kernel.lengthscale = lengthscale
+    lengthscale = torch.as_tensor(lengthscale, dtype=X.dtype, device=X.device)
+    outputscale = torch.as_tensor(outputscale, dtype=X.dtype, device=X.device)
 
-    covar_module = gpytorch.kernels.ScaleKernel(base_kernel)
+    if lengthscale.numel() == 1:
+        lengthscale = lengthscale.reshape(1).expand(batch_size)
+    else:
+        lengthscale = lengthscale.reshape(batch_size)
+
+    if outputscale.numel() == 1:
+        outputscale = outputscale.reshape(1).expand(batch_size)
+    else:
+        outputscale = outputscale.reshape(batch_size)
+
+    mean_module = gpytorch.means.ConstantMean(batch_shape=torch.Size([batch_size])).to(
+        device=X.device,
+        dtype=X.dtype,
+    )
+    mean_module.constant = torch.full(
+        (batch_size,),
+        float(mean_constant),
+        dtype=X.dtype,
+        device=X.device,
+    )
+
+    base_kernel = gpytorch.kernels.RBFKernel(
+        batch_shape=torch.Size([batch_size]),
+        ard_num_dims=gp_dim,
+    ).to(device=X.device, dtype=X.dtype)
+    base_kernel.lengthscale = lengthscale.reshape(batch_size, 1, 1).expand(batch_size, 1, gp_dim)
+
+    covar_module = gpytorch.kernels.ScaleKernel(
+        base_kernel,
+        batch_shape=torch.Size([batch_size]),
+    ).to(device=X.device, dtype=X.dtype)
     covar_module.outputscale = outputscale
 
     return gpytorch.distributions.MultivariateNormal(
@@ -54,7 +84,11 @@ def sample_gp_batch(
         if noise_std is None:
             y = f
         else:
-            y = f + noise_std * torch.randn_like(f)
+            noise_std = torch.as_tensor(noise_std, dtype=f.dtype, device=f.device)
+            if noise_std.numel() == 1:
+                y = f + noise_std * torch.randn_like(f)
+            else:
+                y = f + noise_std.reshape(f.shape[0], 1) * torch.randn_like(f)
 
     return f.detach(), y.detach()
 
