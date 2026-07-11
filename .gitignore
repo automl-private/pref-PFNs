@@ -9,6 +9,10 @@ __pycache__/
 scripts/smoke_gp_log_regret.sh
 logs/
 notebooks/
+checkpoints_fb/
+checkpoints_pool/
+tb_fb/
+pregenerated_batches/
 
 # C extensions
 *.so

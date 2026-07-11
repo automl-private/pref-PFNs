@@ -170,13 +170,7 @@ class QEUBOAgent(PBOAgent):
         model._update(transformed_dp)
 
     def _posterior_mean(self, model: "PairwiseGP", candidate_pool: Tensor) -> Tensor:
-        """
-        Считает posterior mean в точках из `candidate_pool`.
-
-        Для grid и continuous support используется один и тот же путь:
-        сначала точки приводятся к матрице `(M, d)`, затем явно вызывается
-        `model.posterior(X)`.
-        """
+        """Computes posterior mean at every point in the candidate pool."""
         X = candidate_matrix(candidate_pool, dtype=self.dtype, device=self.device)
         with torch.no_grad():
             posterior = model.posterior(X)
@@ -322,6 +316,10 @@ class QEUBOAgent(PBOAgent):
         X_pair[1] = challenger
         return X_pair
 
+    # ------------------------------------------------------------------
+    # PBOAgent interface
+    # ------------------------------------------------------------------
+
     def suggest_pair(
         self,
         comparisons: list[Comparison],
@@ -359,21 +357,23 @@ class QEUBOAgent(PBOAgent):
         """
         Возвращает текущую рекомендацию лучшей точки.
 
-        В обоих режимах выбирает argmax posterior mean среди текущего
-        `candidate_pool`. Для continuous support этот pool является свежей
-        случайной аппроксимацией непрерывной области.
+        В grid режиме выбирает argmax posterior mean среди `candidate_pool`.
+        В continuous режиме оптимизирует posterior mean на `[0, 1]^d`.
         """
         if not comparisons:
             return candidate_value(candidate_pool[len(candidate_pool) // 2])
 
         model = self._fit_model(comparisons)
 
-        if self.support not in {"grid", "continuous_rff"}:
-            raise ValueError(f"Unknown QEUBOAgent support {self.support!r}.")
+        if self.support == "grid":
+            mean = self._posterior_mean(model, candidate_pool)
+            return candidate_value(candidate_pool[mean.argmax()])
 
-        posterior_mean = self._posterior_mean(model, candidate_pool)
-        best_idx = int(posterior_mean.argmax().item())
-        return candidate_value(candidate_pool[best_idx])
+        if self.support == "continuous_rff":
+            X_best = self._optimize_mean_continuous(model, candidate_pool)
+            return candidate_value(X_best)
+
+        raise ValueError(f"Unknown QEUBOAgent support {self.support!r}.")
 
 
 class QEIAgent(QEUBOAgent):

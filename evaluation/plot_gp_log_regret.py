@@ -27,13 +27,22 @@ import torch
 
 
 METHOD_COLORS = {
-    "random": "#4C78A8",
-    "qeubo": "#F58518",
-    "qts": "#54A24B",
-    "qei": "#E45756",
-    "qnei": "#B279A2",
-    "pfn": "#000000",
-    "pfn_botorch": "#9D755D",
+    "random": "#6B7280",
+    "qeubo": "#1F77B4",
+    "qts": "#2CA02C",
+    "qei": "#D62728",
+    "qnei": "#9467BD",
+    "pfn": "#111827",
+    "pfn_botorch": "#8C564B",
+    "pfn_gp_recommend": "#E377C2",
+    "pfn_gp_incumbent": "#17BECF",
+    "random_v1": "#111827",
+    "qeubo_v1": "#00A6D6",
+    "qts_v1": "#00B050",
+    "qei_v1": "#FF1493",
+    "qnei_v1": "#7C3AED",
+    "pfn_v1": "#F97316",
+    "pfn_botorch_v1": "#A16207",
 }
 
 
@@ -139,7 +148,7 @@ def plot_suite(
     eps: float,
     method_colors: Mapping[str, str],
 ) -> None:
-    fig, ax = plt.subplots(figsize=(10.5, 6.2))
+    fig, ax = plt.subplots(figsize=(14.0, 8.2))
 
     plotted = 0
     for method_name, payload in suite["methods"].items():
@@ -148,13 +157,19 @@ def plot_suite(
         y, lower, upper, counts = plot_series(payload, eps=eps)
         x = np.arange(1, len(y) + 1)
         metadata = payload.get("metadata", {})
-        linestyle = "--" if metadata.get("is_in_domain") is False else "-"
+        if method_name.endswith("_v1"):
+            linestyle = ":"
+        elif metadata.get("is_in_domain") is False:
+            linestyle = "--"
+        else:
+            linestyle = "-"
+        linewidth = 2.8 if method_name.endswith("_v1") else 2.0
         line = ax.plot(
             x,
             y,
             label=display_label(method_name, metadata),
             color=method_colors.get(method_name),
-            linewidth=2.0,
+            linewidth=linewidth,
             linestyle=linestyle,
         )[0]
         ax.fill_between(
@@ -174,7 +189,7 @@ def plot_suite(
     ax.set_xlabel("# preference comparisons")
     ax.set_ylabel("log10(mean simple regret)")
     ax.grid(True, alpha=0.25)
-    ax.legend(fontsize=8, ncol=2)
+    ax.legend(fontsize=9, ncol=3)
     fig.tight_layout()
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -199,7 +214,7 @@ def plot_all_suites(
     n = len(suites)
     cols = min(2, n)
     rows = int(math.ceil(n / cols))
-    fig, axes = plt.subplots(rows, cols, figsize=(9.0 * cols, 5.2 * rows), squeeze=False)
+    fig, axes = plt.subplots(rows, cols, figsize=(10.5 * cols, 6.2 * rows), squeeze=False)
     axes_flat = axes.ravel()
 
     for ax, (suite_name, suite) in zip(axes_flat, suites.items()):
@@ -209,13 +224,19 @@ def plot_all_suites(
             y, lower, upper, counts = plot_series(payload, eps=eps)
             x = np.arange(1, len(y) + 1)
             metadata = payload.get("metadata", {})
-            linestyle = "--" if metadata.get("is_in_domain") is False else "-"
+            if method_name.endswith("_v1"):
+                linestyle = ":"
+            elif metadata.get("is_in_domain") is False:
+                linestyle = "--"
+            else:
+                linestyle = "-"
+            linewidth = 2.5 if method_name.endswith("_v1") else 1.8
             line = ax.plot(
                 x,
                 y,
                 label=display_label(method_name, metadata),
                 color=method_colors.get(method_name),
-                linewidth=1.8,
+                linewidth=linewidth,
                 linestyle=linestyle,
             )[0]
             ax.fill_between(

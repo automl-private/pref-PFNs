@@ -7,7 +7,7 @@ import torch
 from pfns.priors import Batch
 from pfns.priors.prior import PriorConfig
 
-torch.set_default_dtype(torch.double)
+torch.set_default_dtype(torch.float32)
 
 
 def make_gp_prior(
