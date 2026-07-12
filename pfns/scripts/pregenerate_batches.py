@@ -4,6 +4,7 @@ from dataclasses import fields
 from pathlib import Path
 
 import torch
+from tqdm import tqdm
 
 from pfns.priors.prior import Batch
 from pfns.run_training_cli import load_config_from_python
@@ -22,6 +23,22 @@ def _batch_to_payload(batch: Batch) -> dict:
     }
 
 
+def _merge_payloads(payloads: list[dict]) -> dict:
+    if len(payloads) == 1:
+        return payloads[0]
+
+    merged = {}
+    for field in fields(Batch):
+        values = [payload[field.name] for payload in payloads]
+        first = values[0]
+        merged[field.name] = (
+            torch.cat(values, dim=0)
+            if torch.is_tensor(first) and first.ndim > 0
+            else first
+        )
+    return merged
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Pregenerate PFN training batches from an existing config.",
@@ -32,12 +49,16 @@ def parse_args():
     parser.add_argument("--num-batches", type=int, default=None)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--config-index", type=int, default=0)
+    parser.add_argument("--sample-chunk-size", type=int, default=16)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.sample_chunk_size < 1:
+        raise ValueError("--sample-chunk-size must be positive.")
+
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -62,6 +83,7 @@ def main():
         "num_batches": num_batches,
         "steps_per_epoch": steps_per_epoch,
         "device_used_for_generation": args.device,
+        "sample_chunk_size": args.sample_chunk_size,
         "batch_shape_sampler": config.batch_shape_sampler,
     }
     torch.save(metadata, out_dir / "metadata.pt")
@@ -73,11 +95,26 @@ def main():
         kwargs = batch_shape.as_get_batch_kwargs()
         kwargs["device"] = args.device
 
-        batch = get_batch(**kwargs)
-        if batch.single_eval_pos is None:
-            batch.single_eval_pos = batch_shape.single_eval_pos
+        payloads = []
+        with tqdm(
+            total=batch_shape.batch_size,
+            desc=f"Batch {batch_idx + 1}/{num_batches}",
+            unit="sample",
+            leave=False,
+        ) as progress:
+            for start in range(0, batch_shape.batch_size, args.sample_chunk_size):
+                chunk_kwargs = dict(kwargs)
+                chunk_kwargs["batch_size"] = min(
+                    args.sample_chunk_size,
+                    batch_shape.batch_size - start,
+                )
+                batch = get_batch(**chunk_kwargs)
+                if batch.single_eval_pos is None:
+                    batch.single_eval_pos = batch_shape.single_eval_pos
+                payloads.append(_batch_to_payload(batch))
+                progress.update(chunk_kwargs["batch_size"])
 
-        payload = _batch_to_payload(batch)
+        payload = _merge_payloads(payloads)
         torch.save(payload, out_dir / f"batch_{batch_idx:08d}.pt")
 
         if (batch_idx + 1) % 100 == 0 or batch_idx + 1 == num_batches:

@@ -74,7 +74,7 @@ def get_batch(
     jitter=1e-6,
     **kwargs,
 ):
-    assert num_features == 2, "pref_gp_1d only supports num_features=2"
+    assert num_features >= 2 and num_features % 2 == 0
     assert single_eval_pos is not None
     assert 0 <= single_eval_pos <= seq_len
 
