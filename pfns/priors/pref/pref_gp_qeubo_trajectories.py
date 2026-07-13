@@ -18,13 +18,16 @@ def make_gp_prior(
     mean_constant=0.0,
     jitter=1e-6,
 ):
-    mean_module = gpytorch.means.ConstantMean()
+    mean_module = gpytorch.means.ConstantMean().to(device=X.device, dtype=X.dtype)
     mean_module.initialize(constant=mean_constant)
 
-    base_kernel = gpytorch.kernels.RBFKernel()
+    base_kernel = gpytorch.kernels.RBFKernel().to(device=X.device, dtype=X.dtype)
     base_kernel.lengthscale = lengthscale
 
-    covar_module = gpytorch.kernels.ScaleKernel(base_kernel)
+    covar_module = gpytorch.kernels.ScaleKernel(base_kernel).to(
+        device=X.device,
+        dtype=X.dtype,
+    )
     covar_module.outputscale = outputscale
 
     return gpytorch.distributions.MultivariateNormal(
