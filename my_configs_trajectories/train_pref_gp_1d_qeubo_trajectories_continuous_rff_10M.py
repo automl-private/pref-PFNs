@@ -24,7 +24,7 @@ model = TransformerConfig(
 optimizer = OptimizerConfig(optimizer="adamw", lr=3e-4)
 
 batch_shape_sampler = BatchShapeSamplerConfig(
-    batch_size=1024,
+    batch_size=100,
     base_for_exp_decay=0.95,
     min_single_eval_pos=0,
     max_single_eval_pos=99,

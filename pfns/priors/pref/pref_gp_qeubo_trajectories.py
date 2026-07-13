@@ -5,6 +5,7 @@ import gpytorch
 import torch
 
 from evaluation.agents.qeubo_agent import QEUBOAgent
+from evaluation.agents.base import candidate_value
 from pfns.priors import Batch
 from pfns.priors.prior import PriorConfig
 
@@ -95,7 +96,7 @@ def get_batch(
     rff_num_features=4096,
     **kwargs,
 ):
-    assert num_features == 2, "pref_gp_1d only supports num_features=2"
+    assert num_features >= 2 and num_features % 2 == 0
     assert single_eval_pos is not None
     assert 0 <= single_eval_pos <= seq_len
     assert n_init >= 0
@@ -161,7 +162,7 @@ def get_batch(
     for t in range(seq_len):
         if t < single_eval_pos:
             for batch_index in range(batch_size):
-                candidate_pool = X[batch_index, :, 0]
+                candidate_pool = X[batch_index]
                 if t < n_init:
                     pair = candidate_pool[
                         torch.randperm(len(candidate_pool), device=device)[:2]
@@ -173,8 +174,14 @@ def get_batch(
                     pair = torch.tensor([x0, x1], device=device, dtype=X.dtype)
 
                 if support == "grid":
-                    first_index = (candidate_pool - pair[0]).abs().argmin()
-                    second_index = (candidate_pool - pair[1]).abs().argmin()
+                    first_index = torch.linalg.vector_norm(
+                        candidate_pool - pair[0],
+                        dim=-1,
+                    ).argmin()
+                    second_index = torch.linalg.vector_norm(
+                        candidate_pool - pair[1],
+                        dim=-1,
+                    ).argmin()
                     prefer_second = (
                         Ys[batch_index, second_index] > Ys[batch_index, first_index]
                     )
@@ -193,8 +200,10 @@ def get_batch(
                 if prefer_second:
                     pair = pair.flip(0)
 
-                comparisons[batch_index].append((pair[0].item(), pair[1].item()))
-                new_X[batch_index, t] = pair
+                comparisons[batch_index].append(
+                    (candidate_value(pair[0]), candidate_value(pair[1]))
+                )
+                new_X[batch_index, t] = pair.reshape(-1)
         else:
             i0 = 2 * t
             i1 = 2 * t + 1
