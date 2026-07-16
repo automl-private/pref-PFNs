@@ -27,15 +27,19 @@ import torch
 
 
 METHOD_COLORS = {
-    "random": "#6B7280",
-    "qeubo": "#1F77B4",
-    "qts": "#2CA02C",
-    "qei": "#D62728",
-    "qnei": "#9467BD",
-    "pfn": "#111827",
-    "pfn_botorch": "#8C564B",
-    "pfn_gp_recommend": "#E377C2",
-    "pfn_gp_incumbent": "#17BECF",
+    "random": "#5A5A5A",
+    "qeubo": "#0066FF",
+    "qts": "#00A651",
+    "qei": "#E41A1C",
+    "qnei": "#8E44AD",
+    "pfn": "#000000",
+    "pfn_botorch": "#8B4513",
+    "pfn_gp_recommend": "#FF1493",
+    "pfn_gp_incumbent": "#00AFC8",
+    "pfn_pool": "#000000",
+    "pfn_botorch_pool": "#E6AC00",
+    "pfn_gp_recommend_pool": "#FF6D00",
+    "pfn_gp_incumbent_pool": "#3949AB",
     "random_v1": "#111827",
     "qeubo_v1": "#00A6D6",
     "qts_v1": "#00B050",
@@ -159,11 +163,13 @@ def plot_suite(
         metadata = payload.get("metadata", {})
         if method_name.endswith("_v1"):
             linestyle = ":"
+        elif method_name.endswith("_pool"):
+            linestyle = "--"
         elif metadata.get("is_in_domain") is False:
             linestyle = "--"
         else:
             linestyle = "-"
-        linewidth = 2.8 if method_name.endswith("_v1") else 2.0
+        linewidth = 3.2 if method_name.endswith(("_v1", "_pool")) else 2.7
         line = ax.plot(
             x,
             y,
@@ -177,7 +183,7 @@ def plot_suite(
             lower,
             upper,
             color=line.get_color(),
-            alpha=0.16,
+            alpha=0.1,
             linewidth=0,
         )
         plotted += 1
@@ -226,11 +232,13 @@ def plot_all_suites(
             metadata = payload.get("metadata", {})
             if method_name.endswith("_v1"):
                 linestyle = ":"
+            elif method_name.endswith("_pool"):
+                linestyle = "--"
             elif metadata.get("is_in_domain") is False:
                 linestyle = "--"
             else:
                 linestyle = "-"
-            linewidth = 2.5 if method_name.endswith("_v1") else 1.8
+            linewidth = 3.0 if method_name.endswith(("_v1", "_pool")) else 2.5
             line = ax.plot(
                 x,
                 y,
@@ -244,7 +252,7 @@ def plot_all_suites(
                 lower,
                 upper,
                 color=line.get_color(),
-                alpha=0.14,
+                alpha=0.09,
                 linewidth=0,
             )
         ax.set_title(suite_subtitle(suite, compact=True))

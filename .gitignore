@@ -13,6 +13,9 @@ checkpoints_fb/
 checkpoints_pool/
 tb_fb/
 pregenerated_batches/
+scripts/evaluate_checkpoints_pool_continuous_gpu.sh
+scripts/evaluate_checkpoints_pool_grid_gpu.sh
+AGENTS.md
 
 # C extensions
 *.so

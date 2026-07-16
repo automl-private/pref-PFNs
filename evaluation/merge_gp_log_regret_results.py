@@ -55,6 +55,12 @@ def parse_args() -> argparse.Namespace:
         help="Merged output .pt file.",
     )
     parser.add_argument(
+        "--method-suffixes",
+        nargs="+",
+        default=None,
+        help="Optional suffix for method names from each input, in input order.",
+    )
+    parser.add_argument(
         "--on-conflict",
         choices=("error", "replace", "skip"),
         default="error",
@@ -183,10 +189,15 @@ def merge_results(
     allow_metadata_mismatch: bool,
     allow_shape_mismatch: bool,
     require_same_suites: bool,
+    method_suffixes: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     loaded = [(path, load_result(path)) for path in inputs]
     if not loaded:
         raise ValueError("No input files were provided.")
+    if method_suffixes is None:
+        method_suffixes = [""] * len(loaded)
+    if len(method_suffixes) != len(loaded):
+        raise ValueError("--method-suffixes must contain one suffix per input file.")
 
     first_path, first_result = loaded[0]
     reference_metadata = first_result["metadata"]
@@ -200,7 +211,7 @@ def merge_results(
     merged["metadata"]["merged_from"] = []
     merged["metadata"]["selected_methods"] = []
 
-    for path, result in loaded:
+    for (path, result), method_suffix in zip(loaded, method_suffixes):
         if not allow_metadata_mismatch:
             check_metadata_compatible(reference_metadata, result["metadata"], path=path)
         if require_same_suites:
@@ -236,16 +247,20 @@ def merge_results(
 
             merged_methods = merged["suites"][suite_name]["methods"]
             for method_name, payload in suite["methods"].items():
-                if method_name in merged_methods:
+                merged_method_name = f"{method_name}{method_suffix}"
+                if merged_method_name in merged_methods:
                     if on_conflict == "error":
                         raise ValueError(
-                            f"Duplicate method {method_name!r} in suite {suite_name!r} from {path}. "
+                            f"Duplicate method {merged_method_name!r} in suite {suite_name!r} from {path}. "
                             "Use --on-conflict replace or skip if this is intentional."
                         )
                     if on_conflict == "skip":
                         continue
 
-                merged_methods[method_name] = copy.deepcopy(payload)
+                merged_payload = copy.deepcopy(payload)
+                if isinstance(merged_payload.get("metadata"), dict):
+                    merged_payload["metadata"]["method_name"] = merged_method_name
+                merged_methods[merged_method_name] = merged_payload
 
     selected_methods: list[str] = []
     for suite in merged["suites"].values():
@@ -269,6 +284,7 @@ def main() -> None:
         allow_metadata_mismatch=args.allow_metadata_mismatch,
         allow_shape_mismatch=args.allow_shape_mismatch,
         require_same_suites=args.require_same_suites,
+        method_suffixes=args.method_suffixes,
     )
 
     args.out.parent.mkdir(parents=True, exist_ok=True)

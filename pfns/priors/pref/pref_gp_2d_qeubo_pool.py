@@ -10,4 +10,4 @@ from pfns.priors.pref.pref_gp_1d_qeubo_pool import (
 
 @dataclass(frozen=True)
 class PrefGP2DqEUBOPoolPriorConfig(PrefGP1DqEUBOPoolPriorConfig):
-    pass
+    expected_num_features = 4

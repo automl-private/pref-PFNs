@@ -1,11 +1,17 @@
 from dataclasses import dataclass
 from functools import partial
+from typing import ClassVar
 
 import torch
 
 from pfns.priors import Batch
 from pfns.priors.pref.pref_gp_1d_qeubo import make_gp_prior, sample_gp_batch
 from pfns.priors.prior import PriorConfig
+
+# GP сначала вычисляется только на P фиксированных точках. 
+# Вся обучающая последовательность затем составляется выборкой из этого пула. 
+# Поэтому количество уникальных точек ограничено pool_size, 
+# а одни и те же точки могут повторно участвовать в разных сравнениях.
 
 
 def get_batch(
@@ -22,16 +28,21 @@ def get_batch(
     noise_std=0.05,
     jitter=1e-6,
     pool_size=100,
+    expected_num_features=2,
     **kwargs,
 ):
     assert num_features >= 2 and num_features % 2 == 0
     assert single_eval_pos is not None
     assert 0 <= single_eval_pos <= seq_len
     assert pool_size >= 2
+    if num_features != expected_num_features:
+        raise ValueError(
+            f"Expected num_features={expected_num_features}, got {num_features}."
+        )
 
     gp_dim = num_features // 2
 
-    pool_X = torch.rand(batch_size, pool_size, gp_dim, device=device)
+    pool_X = torch.rand(batch_size, pool_size, gp_dim, device=device) # (B, P, d)
     pool_Fs, pool_Ys = sample_gp_batch(
         pool_X,
         lengthscale=lengthscale,
@@ -45,7 +56,7 @@ def get_batch(
         pool_size,
         (batch_size, 2 * seq_len),
         device=device,
-    )
+    ) # сэмплинг с возвращением
     batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)
     X = pool_X[batch_indices, point_indices]
     Fs = pool_Fs[batch_indices, point_indices]
@@ -90,6 +101,7 @@ def get_batch(
 
 @dataclass(frozen=True)
 class PrefGP1DqEUBOPoolPriorConfig(PriorConfig):
+    expected_num_features: ClassVar[int] = 2
     lengthscale: float = 0.2
     outputscale: float = 1.0
     mean_constant: float = 0.0
@@ -106,4 +118,5 @@ class PrefGP1DqEUBOPoolPriorConfig(PriorConfig):
             noise_std=self.noise_std,
             jitter=self.jitter,
             pool_size=self.pool_size,
+            expected_num_features=self.expected_num_features,
         )

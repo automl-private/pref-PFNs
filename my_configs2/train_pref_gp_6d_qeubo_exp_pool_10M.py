@@ -3,12 +3,11 @@ from pfns.optimizer import OptimizerConfig
 from pfns.batch_shape_sampler import BatchShapeSamplerConfig
 from pfns.model.transformer_config import TransformerConfig
 from pfns.model.bar_distribution import BarDistributionConfig
-from pfns.priors.pref.pref_gp_1d_qeubo_pool import PrefGP1DqEUBOPoolPriorConfig
+from pfns.priors.pref.pref_gp_6d_qeubo_pool import PrefGP6DqEUBOPoolPriorConfig
 
-# Continuous regression target distribution.
-# Wide borders + full_support=True works well for unbounded GP targets.
+
 criterion = BarDistributionConfig(
-    borders=[-5.0 + 0.05 * i for i in range(201)],   # [-5, 5] in 0.05 steps
+    borders=[-5.0 + 0.05 * i for i in range(201)],
     full_support=True,
 )
 
@@ -18,7 +17,7 @@ model = TransformerConfig(
     nhid=256,
     nlayers=6,
     nhead=4,
-    features_per_group=2,  # as we do not have attention between features, we should put them all in one group
+    features_per_group=12,
     attention_between_features=False,
 )
 
@@ -31,13 +30,13 @@ batch_shape_sampler = BatchShapeSamplerConfig(
     batch_size=100,
     base_for_exp_decay=0.95,
     min_single_eval_pos=0,
-    max_single_eval_pos=99,  # restrict to small context sizes
+    max_single_eval_pos=99,
     max_seq_len=100,
-    min_num_features=2,
-    max_num_features=2,   # 1D GP, but x in pair-comparisons get concatenated 
+    min_num_features=12,
+    max_num_features=12,
 )
 
-prior = PrefGP1DqEUBOPoolPriorConfig(
+prior = PrefGP6DqEUBOPoolPriorConfig(
     lengthscale=0.2,
     outputscale=1.0,
     noise_std=0.05,
@@ -55,11 +54,11 @@ config = MainConfig(
     train_mixed_precision=False,
     scheduler="cosine_decay",
     warmup_epochs=100,
-    train_state_dict_save_path="/work/dlclarge2/adriaens-pref-pfn/checkpoints/pfn_pref_gp_1d_qeubo_exp_pool_10M.pt",
-    train_state_dict_load_path="/work/dlclarge2/adriaens-pref-pfn/checkpoints/pfn_pref_gp_1d_qeubo_exp_pool_10M.pt",
+    train_state_dict_save_path="/work/dlclarge2/adriaens-pref-pfn/checkpoints/pfn_pref_gp_6d_qeubo_exp_pool_10M.pt",
+    train_state_dict_load_path="/work/dlclarge2/adriaens-pref-pfn/checkpoints/pfn_pref_gp_6d_qeubo_exp_pool_10M.pt",
     validation_period=5,
     verbose=True,
     progress_bar=False,
-    tensorboard_path="/work/dlclarge2/adriaens-pref-pfn/tb/pref_gp_1d_qeubo_exp_pool_10M",
+    tensorboard_path="/work/dlclarge2/adriaens-pref-pfn/tb/pref_gp_6d_qeubo_exp_pool_10M",
     num_workers=0,
 )
