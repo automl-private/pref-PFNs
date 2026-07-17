@@ -7,9 +7,14 @@ import torch
 from pfns.priors.prior import Batch, PriorConfig
 
 
-def _load_payload(path: Path) -> dict:
+def _load_payload(path: Path, *, mmap: bool = False) -> dict:
     try:
-        return torch.load(path, map_location="cpu", weights_only=False)
+        return torch.load(
+            path,
+            map_location="cpu",
+            weights_only=False,
+            mmap=mmap,
+        )
     except TypeError:
         return torch.load(path, map_location="cpu")
 
@@ -23,12 +28,28 @@ class PregeneratedBatchPriorConfig(PriorConfig):
     strict_shapes: bool = True
 
     def create_get_batch_method(self):
-        data_dir = Path(self.data_dir)
-        batch_paths = sorted(data_dir.glob("batch_*.pt"))
-        if not batch_paths:
-            raise FileNotFoundError(f"No pregenerated batch_*.pt files found in {data_dir}.")
+        data_path = Path(self.data_dir)
+        stacked_payload = None
+        if data_path.is_file():
+            stacked_payload = _load_payload(data_path, mmap=True)
+            if stacked_payload.get("format") != "stacked_pregenerated_batches_v1":
+                raise ValueError(f"{data_path} is not a stacked pregenerated batch file.")
+            num_batches = int(stacked_payload["num_batches"])
+            if stacked_payload["x"].shape[0] != num_batches:
+                raise ValueError(
+                    f"{data_path} contains {stacked_payload['x'].shape[0]} batches, "
+                    f"but num_batches={num_batches}."
+                )
+            batch_paths = None
+        else:
+            batch_paths = sorted(data_path.glob("batch_*.pt"))
+            if not batch_paths:
+                raise FileNotFoundError(
+                    f"No pregenerated batch_*.pt files found in {data_path}."
+                )
+            num_batches = len(batch_paths)
 
-        order = list(range(len(batch_paths)))
+        order = list(range(num_batches))
         rng = random.Random(self.seed)
         if self.shuffle:
             rng.shuffle(order)
@@ -46,26 +67,42 @@ class PregeneratedBatchPriorConfig(PriorConfig):
         ):
             if state["index"] >= len(order):
                 if not self.cycle:
-                    raise StopIteration(f"Pregenerated batches in {data_dir} are exhausted.")
+                    raise StopIteration(
+                        f"Pregenerated batches in {data_path} are exhausted."
+                    )
                 state["index"] = 0
                 if self.shuffle:
                     rng.shuffle(order)
 
-            path = batch_paths[order[state["index"]]]
+            batch_index = order[state["index"]]
             state["index"] += 1
 
-            payload = _load_payload(path)
-            batch_kwargs = {
-                name: payload.get(name)
-                for name in batch_field_names
-            }
+            if stacked_payload is None:
+                source = batch_paths[batch_index]
+                payload = _load_payload(source)
+                batch_kwargs = {
+                    name: payload.get(name)
+                    for name in batch_field_names
+                }
+            else:
+                source = data_path
+                batch_kwargs = {}
+                for name in batch_field_names:
+                    value = stacked_payload.get(name)
+                    if torch.is_tensor(value):
+                        value = value[batch_index]
+                    batch_kwargs[name] = value
+                batch_kwargs["single_eval_pos"] = int(
+                    stacked_payload["single_eval_pos"][batch_index]
+                )
             batch = Batch(**batch_kwargs)
 
             if self.strict_shapes:
                 expected_x_shape = (batch_size, seq_len, num_features)
                 if tuple(batch.x.shape) != expected_x_shape:
                     raise ValueError(
-                        f"{path} has x.shape={tuple(batch.x.shape)}, expected {expected_x_shape}."
+                        f"{source} has x.shape={tuple(batch.x.shape)}, "
+                        f"expected {expected_x_shape}."
                     )
 
             return batch
