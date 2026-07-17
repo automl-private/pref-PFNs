@@ -150,7 +150,6 @@ def get_batch(
 
     new_X = torch.zeros(batch_size, seq_len, num_features, device=device, dtype=X.dtype)
     qeubo = torch.zeros(batch_size, seq_len, device=device, dtype=Fs.dtype)
-    comparisons = [[] for _ in range(batch_size)]
     agent = QEUBOAgent(
         fit_hyperparams=False,
         device=device,
@@ -159,8 +158,41 @@ def get_batch(
         gp_outputscale=outputscale,
     )
 
-    for t in range(seq_len):
-        if t < single_eval_pos:
+    if support == "grid":
+        comparisons = torch.empty(
+            batch_size,
+            0,
+            2,
+            dtype=torch.long,
+            device=device,
+        )
+        batch_indices = torch.arange(batch_size, device=device)
+        for t in range(single_eval_pos):
+            if t < n_init:
+                pair_indices = torch.rand(
+                    batch_size,
+                    len(X[0]),
+                    device=device,
+                ).topk(2, dim=-1).indices
+            else:
+                pair_indices = agent.suggest_pairs_batched_grid(X, comparisons)
+
+            observed = Ys.gather(1, pair_indices)
+            prefer_second = observed[:, 1] > observed[:, 0]
+            ordered_indices = pair_indices.clone()
+            ordered_indices[prefer_second] = ordered_indices[prefer_second].flip(-1)
+            comparisons = torch.cat(
+                [comparisons, ordered_indices.unsqueeze(1)],
+                dim=1,
+            )
+            pair = X[
+                batch_indices.unsqueeze(-1),
+                ordered_indices,
+            ]
+            new_X[:, t] = pair.reshape(batch_size, num_features)
+    else:
+        comparisons = [[] for _ in range(batch_size)]
+        for t in range(single_eval_pos):
             for batch_index in range(batch_size):
                 candidate_pool = X[batch_index]
                 if t < n_init:
@@ -173,29 +205,16 @@ def get_batch(
                     )
                     pair = torch.tensor([x0, x1], device=device, dtype=X.dtype)
 
-                if support == "grid":
-                    first_index = torch.linalg.vector_norm(
-                        candidate_pool - pair[0],
-                        dim=-1,
-                    ).argmin()
-                    second_index = torch.linalg.vector_norm(
-                        candidate_pool - pair[1],
-                        dim=-1,
-                    ).argmin()
-                    prefer_second = (
-                        Ys[batch_index, second_index] > Ys[batch_index, first_index]
-                    )
-                else:
-                    observed = evaluate_rff(
-                        pair,
-                        rff_weights[batch_index],
-                        rff_phases[batch_index],
-                        rff_coefficients[batch_index],
-                        rff_scale,
-                        mean_constant,
-                    )
-                    observed = observed + noise_std * torch.randn_like(observed)
-                    prefer_second = observed[1] > observed[0]
+                observed = evaluate_rff(
+                    pair,
+                    rff_weights[batch_index],
+                    rff_phases[batch_index],
+                    rff_coefficients[batch_index],
+                    rff_scale,
+                    mean_constant,
+                )
+                observed = observed + noise_std * torch.randn_like(observed)
+                prefer_second = observed[1] > observed[0]
 
                 if prefer_second:
                     pair = pair.flip(0)
@@ -204,18 +223,15 @@ def get_batch(
                     (candidate_value(pair[0]), candidate_value(pair[1]))
                 )
                 new_X[batch_index, t] = pair.reshape(-1)
-        else:
-            i0 = 2 * t
-            i1 = 2 * t + 1
-            x0 = X[:, i0, :]
-            x1 = X[:, i1, :]
 
-            # Query: keep original random order, target is max(f0, f1) from noiseless GP
-            f0 = Fs[:, i0]  # (B,)
-            f1 = Fs[:, i1]  # (B,)
-
-            qeubo[:, t] = torch.maximum(f0, f1)
-            new_X[:, t, :] = torch.cat([x0, x1], dim=-1)
+    query_pairs = X.reshape(batch_size, seq_len, 2, gp_dim)
+    query_values = Fs.reshape(batch_size, seq_len, 2)
+    new_X[:, single_eval_pos:] = query_pairs[:, single_eval_pos:].reshape(
+        batch_size,
+        seq_len - single_eval_pos,
+        num_features,
+    )
+    qeubo[:, single_eval_pos:] = query_values[:, single_eval_pos:].max(dim=-1).values
 
     return Batch(
         x=new_X,

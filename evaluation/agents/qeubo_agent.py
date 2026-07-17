@@ -37,6 +37,8 @@ try:
     from botorch.fit import fit_gpytorch_mll
     from botorch.sampling.normal import SobolQMCNormalSampler
     from botorch.utils.sampling import draw_sobol_samples
+    from botorch.utils.probability.utils import standard_normal_log_hazard
+    from linear_operator.utils.cholesky import psd_safe_cholesky
 
     _BOTORCH_AVAILABLE = True
 except ImportError:
@@ -168,6 +170,243 @@ class QEUBOAgent(PBOAgent):
 
         transformed_dp = model.transform_inputs(model.datapoints)
         model._update(transformed_dp)
+
+    def suggest_pairs_batched_grid(
+        self,
+        candidate_pools: Tensor,
+        comparisons: Tensor,
+    ) -> Tensor:
+        """Выбирает qEUBO-пару одновременно для нескольких grid-траекторий.
+
+        `candidate_pools` имеет форму `(B, P, d)`, а `comparisons` —
+        `(B, t, 2)` и содержит индексы winner/loser в соответствующем пуле.
+        Возвращаемый тензор формы `(B, 2)` содержит индексы incumbent и
+        challenger. Метод предназначен для быстрой генерации обучающих
+        траекторий с фиксированными GP-гиперпараметрами.
+        """
+        if self.support != "grid":
+            raise ValueError("Batched pair selection is only available for grid support.")
+        if self.fit_hyperparams:
+            raise ValueError("Batched pair selection requires fixed GP hyperparameters.")
+
+        candidates = candidate_pools.to(dtype=self.dtype, device=self.device)
+        comparisons = comparisons.to(dtype=torch.long, device=self.device)
+        if candidates.ndim != 3:
+            raise ValueError(
+                "candidate_pools must have shape (batch_size, pool_size, input_dim)."
+            )
+
+        batch_size, pool_size, _ = candidates.shape
+        if comparisons.shape[:1] != (batch_size,) or comparisons.shape[-1:] != (2,):
+            raise ValueError("comparisons must have shape (batch_size, context_size, 2).")
+        if comparisons.numel() == 0:
+            return torch.rand(
+                batch_size,
+                pool_size,
+                dtype=self.dtype,
+                device=self.device,
+            ).topk(2, dim=-1).indices
+        if comparisons.min() < 0 or comparisons.max() >= pool_size:
+            raise ValueError("comparison indices must refer to candidate_pools.")
+
+        cache_matches_pool = (
+            getattr(self, "_batched_grid_pool", None) is candidate_pools
+            and getattr(self, "_batched_grid_prior_covar", None) is not None
+        )
+        if cache_matches_pool:
+            prior_covar = self._batched_grid_prior_covar
+        else:
+            scaled_candidates = candidates / self.gp_lengthscale
+            prior_covar = self.gp_outputscale * torch.exp(
+                -0.5 * torch.cdist(scaled_candidates, scaled_candidates).square()
+            )
+            self._batched_grid_pool = candidate_pools
+            self._batched_grid_prior_covar = prior_covar
+            self._batched_grid_utility = None
+
+        # Each trajectory can have a different number of unique observations.
+        # Pad with unused pool points so all linear algebra stays batched.
+        observed = torch.zeros(
+            batch_size,
+            pool_size,
+            dtype=torch.bool,
+            device=self.device,
+        )
+        observed.scatter_(1, comparisons.reshape(batch_size, -1), True)
+        num_datapoints = int(observed.sum(dim=-1).max().item())
+        index_priority = pool_size - torch.arange(pool_size, device=self.device)
+        priority = observed.to(torch.long) * (pool_size + 1) + index_priority
+        datapoint_indices = priority.topk(num_datapoints, dim=-1).indices
+
+        pool_to_datapoint = torch.full(
+            (batch_size, pool_size),
+            -1,
+            dtype=torch.long,
+            device=self.device,
+        )
+        local_indices = torch.arange(num_datapoints, device=self.device).expand(
+            batch_size, -1
+        )
+        pool_to_datapoint.scatter_(1, datapoint_indices, local_indices)
+        local_comparisons = pool_to_datapoint.gather(
+            1, comparisons.reshape(batch_size, -1)
+        ).reshape_as(comparisons)
+
+        with torch.no_grad():
+            candidate_observed_covar = prior_covar.gather(
+                2,
+                datapoint_indices[:, None, :].expand(-1, pool_size, -1),
+            )
+            datapoint_covar = candidate_observed_covar.gather(
+                1,
+                datapoint_indices[:, :, None].expand(
+                    -1, -1, num_datapoints
+                ),
+            )
+            datapoint_covar = datapoint_covar + 1e-6 * self.gp_outputscale * torch.eye(
+                num_datapoints,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            eye = torch.eye(
+                num_datapoints,
+                dtype=self.dtype,
+                device=self.device,
+            ).expand(batch_size, -1, -1)
+            covar_chol = psd_safe_cholesky(
+                datapoint_covar / self.gp_outputscale,
+                jitter=1e-6,
+            ) * self.gp_outputscale**0.5
+
+            winners = local_comparisons[..., 0]
+            losers = local_comparisons[..., 1]
+            comparison_weight = torch.ones_like(winners, dtype=self.dtype)
+            win_balance = torch.zeros(
+                batch_size,
+                num_datapoints,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            win_balance.scatter_add_(1, winners, comparison_weight)
+            win_balance.scatter_add_(1, losers, -comparison_weight)
+            D = torch.zeros(
+                batch_size,
+                comparisons.shape[1],
+                num_datapoints,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            D.scatter_add_(2, winners.unsqueeze(-1), comparison_weight.unsqueeze(-1))
+            D.scatter_add_(2, losers.unsqueeze(-1), -comparison_weight.unsqueeze(-1))
+            has_warm_start = self._batched_grid_utility is not None
+            if has_warm_start:
+                initial_utility = self._batched_grid_utility.gather(
+                    1, datapoint_indices
+                )
+            else:
+                initial_utility = (
+                    win_balance - win_balance.mean(dim=-1, keepdim=True)
+                ) / win_balance.std(
+                    dim=-1,
+                    keepdim=True,
+                    correction=0,
+                ).clamp_min(1e-6)
+            utility = initial_utility
+            num_newton_steps = 2 if has_warm_start else 5
+            for _ in range(num_newton_steps):
+                z = (
+                    utility.gather(1, winners)
+                    - utility.gather(1, losers)
+                ) / 2**0.5
+                z = z.clamp(-3, 3)
+                hazard = standard_normal_log_hazard(-z).exp()
+                hessian_weight = hazard * (hazard + z) / 2
+                hessian = (
+                    D.transpose(-1, -2) * hessian_weight[:, None, :]
+                ) @ D
+                likelihood_gradient = torch.zeros_like(utility)
+                gradient_weight = hazard / 2**0.5
+                likelihood_gradient.scatter_add_(
+                    1, winners, -gradient_weight
+                )
+                likelihood_gradient.scatter_add_(
+                    1, losers, gradient_weight
+                )
+                gradient = torch.cholesky_solve(
+                    utility.unsqueeze(-1),
+                    covar_chol,
+                ).squeeze(-1)
+                gradient = gradient + likelihood_gradient
+                update = torch.linalg.solve_ex(
+                    datapoint_covar @ hessian + eye,
+                    datapoint_covar @ gradient.unsqueeze(-1),
+                    check_errors=False,
+                ).result.squeeze(-1)
+                utility = utility - update
+            z = (
+                utility.gather(1, winners)
+                - utility.gather(1, losers)
+            ) / 2**0.5
+            z = z.clamp(-3, 3)
+            hazard = standard_normal_log_hazard(-z).exp()
+            hessian_weight = hazard * (hazard + z) / 2
+            hessian = (
+                D.transpose(-1, -2) * hessian_weight[:, None, :]
+            ) @ D
+            alpha = torch.cholesky_solve(
+                utility.unsqueeze(-1),
+                covar_chol,
+            )
+            posterior_mean = (candidate_observed_covar @ alpha).squeeze(-1)
+            self._batched_grid_utility = posterior_mean.detach()
+
+            covariance_factor = torch.linalg.solve_ex(
+                hessian @ datapoint_covar + eye,
+                hessian @ candidate_observed_covar.transpose(-1, -2),
+                check_errors=False,
+            ).result
+            prior_variance = prior_covar.diagonal(dim1=-2, dim2=-1)
+            posterior_variance = prior_variance - (
+                candidate_observed_covar * covariance_factor.transpose(-1, -2)
+            ).sum(dim=-1)
+
+            batch_indices = torch.arange(batch_size, device=self.device)
+            incumbent_indices = posterior_mean.argmax(dim=-1)
+            incumbent_candidate_covar = prior_covar[
+                batch_indices, incumbent_indices
+            ]
+            incumbent_observed_covar = candidate_observed_covar[
+                batch_indices, incumbent_indices
+            ]
+            posterior_cross_covar = incumbent_candidate_covar - torch.einsum(
+                "bn,bnp->bp",
+                incumbent_observed_covar,
+                covariance_factor,
+            )
+
+            incumbent_mean = posterior_mean[batch_indices, incumbent_indices]
+            incumbent_variance = posterior_variance[
+                batch_indices, incumbent_indices
+            ]
+            pair_std = (
+                incumbent_variance.unsqueeze(-1)
+                + posterior_variance
+                - 2 * posterior_cross_covar
+            ).clamp_min(torch.finfo(self.dtype).eps).sqrt()
+            standardized_delta = (
+                incumbent_mean.unsqueeze(-1) - posterior_mean
+            ) / pair_std
+            normal_pdf = torch.exp(-0.5 * standardized_delta.square()) / (
+                2 * torch.pi
+            ) ** 0.5
+            eubo = posterior_mean + pair_std * (
+                normal_pdf
+                + standardized_delta * torch.special.ndtr(standardized_delta)
+            )
+            eubo[batch_indices, incumbent_indices] = -torch.inf
+            challenger_indices = eubo.argmax(dim=-1)
+
+        return torch.stack([incumbent_indices, challenger_indices], dim=-1)
 
     def _posterior_mean(self, model: "PairwiseGP", candidate_pool: Tensor) -> Tensor:
         """Computes posterior mean at every point in the candidate pool."""

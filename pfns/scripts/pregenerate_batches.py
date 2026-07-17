@@ -2,6 +2,7 @@
 import argparse
 from dataclasses import fields
 from pathlib import Path
+import time
 
 import torch
 from tqdm import tqdm
@@ -49,15 +50,20 @@ def parse_args():
     parser.add_argument("--num-batches", type=int, default=None)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--config-index", type=int, default=0)
-    parser.add_argument("--sample-chunk-size", type=int, default=16)
+    parser.add_argument(
+        "--sample-chunk-size",
+        type=int,
+        default=0,
+        help="Samples generated per call; 0 uses the complete training batch.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    if args.sample_chunk_size < 1:
-        raise ValueError("--sample-chunk-size must be positive.")
+    if args.sample_chunk_size < 0:
+        raise ValueError("--sample-chunk-size must be non-negative.")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -89,11 +95,13 @@ def main():
     torch.save(metadata, out_dir / "metadata.pt")
 
     for batch_idx in range(num_batches):
+        batch_start = time.perf_counter()
         epoch = batch_idx // steps_per_epoch + 1
         step = batch_idx % steps_per_epoch
         batch_shape = config.batch_shape_sampler.sample_batch_shape(epoch=epoch, step=step)
         kwargs = batch_shape.as_get_batch_kwargs()
         kwargs["device"] = args.device
+        sample_chunk_size = args.sample_chunk_size or batch_shape.batch_size
 
         payloads = []
         with tqdm(
@@ -102,10 +110,10 @@ def main():
             unit="sample",
             leave=False,
         ) as progress:
-            for start in range(0, batch_shape.batch_size, args.sample_chunk_size):
+            for start in range(0, batch_shape.batch_size, sample_chunk_size):
                 chunk_kwargs = dict(kwargs)
                 chunk_kwargs["batch_size"] = min(
-                    args.sample_chunk_size,
+                    sample_chunk_size,
                     batch_shape.batch_size - start,
                 )
                 batch = get_batch(**chunk_kwargs)
@@ -116,6 +124,11 @@ def main():
 
         payload = _merge_payloads(payloads)
         torch.save(payload, out_dir / f"batch_{batch_idx:08d}.pt")
+        batch_seconds = time.perf_counter() - batch_start
+        print(
+            f"Saved batch {batch_idx + 1}/{num_batches} to {out_dir} "
+            f"in {batch_seconds:.3f}s"
+        )
 
         if (batch_idx + 1) % 100 == 0 or batch_idx + 1 == num_batches:
             print(f"Saved {batch_idx + 1}/{num_batches} batches to {out_dir}")
