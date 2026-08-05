@@ -81,7 +81,15 @@ class _BatchedIterableDataset(IterableDataset[Batch]):
             # Prepare kwargs for the actual batch fetching method
             kwargs = batch_shape.as_get_batch_kwargs()
             kwargs.update(self.kwargs)
-
+            
+            if hasattr(self, "model"):
+                kwargs["qeubo_model"] = self.model
+            
+            if not hasattr(self, "rollout_state_caches") or self.rollout_state_caches is None:
+                self.rollout_state_caches = {}
+            
+            kwargs["rollout_state_caches"] = self.rollout_state_caches
+            
             b = self.get_batch_method(**kwargs)
 
             if b.y is not None:
@@ -146,6 +154,7 @@ class StandardDataLoader(DataLoader):
         assert hasattr(
             self, "model"
         ), "Please assign model with `dl.model = ...` before training."
+        self.dataset.model = self.model  # required for passing model to get_batch
         self.epoch_count += 1
         self.worker_init_fn = partial(worker_init_fn, epoch=self.epoch_count)
         # The iteration logic is now handled by _BatchedIterableDataset passed to super().__init__
