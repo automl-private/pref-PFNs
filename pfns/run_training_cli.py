@@ -9,6 +9,7 @@ import os
 import sys
 from pathlib import Path
 
+import pfns.provenance
 import pfns.train
 
 
@@ -128,6 +129,12 @@ def load_config_from_python(
 def main():
     """Main CLI entry point."""
     args = parse_args()
+
+    # Configs usually live outside this repository, so their commit is not implied by the
+    # code commit. Register the file before anything else so the record is complete even if
+    # loading the config fails.
+    pfns.provenance.record_input_file(args.config_file)
+    print(pfns.provenance.format_provenance(), flush=True)
 
     # Load configuration from Python file
     config = load_config_from_python(args.config_file, args.config_index)

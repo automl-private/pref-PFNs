@@ -13,7 +13,7 @@ from torch.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from . import base_config, utils
+from . import base_config, provenance, utils
 from .batch_shape_sampler import BatchShapeSamplerConfig
 from .model.transformer_config import TransformerConfig
 from .optimizer import OptimizerConfig
@@ -752,6 +752,9 @@ def save_checkpoint(
             "optimizer_state_dict": optimizer.state_dict(),
             "epoch": epoch,
             "config": config.to_dict(),
+            # The config fixes the training distribution; this fixes the code that
+            # realized it. See pfns/provenance.py.
+            "provenance": provenance.provenance(),
         }
         if save_function is None:
             os.makedirs(os.path.dirname(train_state_dict_save_path), exist_ok=True)
