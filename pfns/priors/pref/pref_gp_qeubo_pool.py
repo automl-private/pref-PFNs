@@ -93,9 +93,30 @@ def get_batch(
     outputscale=1.0,
     mean_constant=0.0,
     noise_std=0.05,
+    noise_per_comparison=True,
     jitter=1e-6,
     **kwargs,
 ):
+    """Preferential qEUBO prior over a finite candidate pool.
+
+    `noise_per_comparison` selects the comparison likelihood:
+
+    - ``True`` (default, standard preferential model): the latent `f` is drawn once on the
+      pool and **fresh observation noise is drawn for every comparison**, so
+      `P(i > j) = P(f_i + e_i > f_j + e_j)` independently per comparison and repeated or
+      chained comparisons can contradict each other. This matches the probit likelihood used
+      by BoTorch's `PairwiseGP`, by `pref_gp_1d_qeubo_regret_v3.py`, and by the ground-truth
+      sampler in `scripts/pbo_ground_truth.py`.
+    - ``False`` (legacy): noise is drawn **once per pool point** and frozen, so every
+      comparison is read off a single fixed total order on `y` and contradictions are
+      impossible. This was the behaviour of this file before the fix and is retained only so
+      the training distribution of the existing `*_pool_*` checkpoints stays reproducible.
+
+    The distinction only has an effect when a pool point takes part in more than one
+    comparison, i.e. it grows with the average degree `2 * n_ctx / pool_size` of the
+    comparison graph. It is negligible at the historical default (degree <= 1.98) and
+    first-order once the degree is raised deliberately.
+    """
     assert num_features % 2 == 0, (
         "Preferential GP qEUBO prior expects num_features = 2 * gp_dim, "
         f"got num_features={num_features}."
@@ -119,12 +140,14 @@ def get_batch(
 
     # Sample GP values on the finite pool
     # Fs, Ys: (B, K)
+    # With per-comparison noise the pool carries only the latent f; the noise is added later,
+    # once per comparison. With the legacy per-point noise it is frozen here.
     Fs, Ys = sample_gp_batch(
         pool_X,
         lengthscale=lengthscale,
         outputscale=outputscale,
         mean_constant=mean_constant,
-        noise_std=noise_std,
+        noise_std=None if noise_per_comparison else noise_std,
         jitter=jitter,
     )
 
@@ -160,8 +183,21 @@ def get_batch(
         x0 = pool_X[batch_idx[:, None], idx0_ctx]  # (B, n_ctx, gp_dim)
         x1 = pool_X[batch_idx[:, None], idx1_ctx]  # (B, n_ctx, gp_dim)
 
-        y0 = Ys[batch_idx[:, None], idx0_ctx]      # (B, n_ctx)
-        y1 = Ys[batch_idx[:, None], idx1_ctx]      # (B, n_ctx)
+        if noise_per_comparison:
+            f0_ctx = Fs[batch_idx[:, None], idx0_ctx]  # (B, n_ctx)
+            f1_ctx = Fs[batch_idx[:, None], idx1_ctx]  # (B, n_ctx)
+
+            if noise_std is None or noise_std == 0.0:
+                y0 = f0_ctx
+                y1 = f1_ctx
+            else:
+                # Fresh noise per comparison occurrence
+                y0 = f0_ctx + noise_std * torch.randn_like(f0_ctx)
+                y1 = f1_ctx + noise_std * torch.randn_like(f1_ctx)
+        else:
+            # Legacy: a single frozen noisy value per pool point
+            y0 = Ys[batch_idx[:, None], idx0_ctx]  # (B, n_ctx)
+            y1 = Ys[batch_idx[:, None], idx1_ctx]  # (B, n_ctx)
 
         prefer_x0 = (y0 > y1).unsqueeze(-1)        # (B, n_ctx, 1)
 
@@ -206,6 +242,12 @@ class PrefGPqEUBOPoolPriorConfig(PriorConfig):
     # New finite-pool parameter
     pool_size: int = 100
 
+    # Draw fresh observation noise for every comparison (standard preferential likelihood)
+    # rather than freezing one noisy value per pool point. See `get_batch` for details.
+    # Set to False only to reproduce the training distribution of checkpoints produced before
+    # 2026-08-06, i.e. all existing `pfn_pref_gp_*d_qeubo_*_pool_*.pt`.
+    noise_per_comparison: bool = True
+
     def create_get_batch_method(self):
         return partial(
             get_batch,
@@ -214,5 +256,6 @@ class PrefGPqEUBOPoolPriorConfig(PriorConfig):
             outputscale=self.outputscale,
             mean_constant=self.mean_constant,
             noise_std=self.noise_std,
+            noise_per_comparison=self.noise_per_comparison,
             jitter=self.jitter,
         )
