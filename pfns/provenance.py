@@ -68,18 +68,27 @@ def repo_state(path: str | os.PathLike) -> dict | None:
 
     Returns None when `path` is not inside a git repository, which is a normal situation
     (an installed package, a config kept outside version control) and not an error.
+
+    ``dirty`` counts TRACKED modifications only. It previously used a bare
+    ``git status --porcelain``, which also counts untracked files, so a script writing an
+    output file into the tree marked the *next* run DIRTY and the flag cried wolf on runs
+    whose code was exactly a commit. Untracked files cannot change which code ran; they are
+    reported separately as ``untracked`` because a new source file can be imported without
+    ever being committed.
     """
     start = Path(path)
     start = start if start.is_dir() else start.parent
     root = _git(start, "rev-parse", "--show-toplevel")
     if not root:
         return None
-    status = _git(start, "status", "--porcelain")
+    tracked = _git(start, "status", "--porcelain", "--untracked-files=no")
+    untracked = _git(start, "ls-files", "--others", "--exclude-standard")
     return {
         "root": root,
         "commit": _git(start, "rev-parse", "HEAD"),
         "branch": _git(start, "rev-parse", "--abbrev-ref", "HEAD"),
-        "dirty": None if status is None else bool(status),
+        "dirty": None if tracked is None else bool(tracked),
+        "untracked": None if untracked is None else len(untracked.splitlines()),
     }
 
 
@@ -141,6 +150,9 @@ def format_provenance(p: dict | None = None) -> str:
             state = "  (dirty state unknown)"
         else:
             state = ""
+        n_untracked = r.get("untracked")
+        if n_untracked:
+            state += f"  [+{n_untracked} untracked]"
         return f"  {label:<10} {commit} on {r['branch'] or '?'}{state}"
 
     lines = ["[provenance]", line("code", p["code"])]
