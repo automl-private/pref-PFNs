@@ -98,7 +98,10 @@ def provenance() -> dict:
     try:
         import torch
 
-        torch_version = torch.__version__
+        # str(): torch.__version__ is a TorchVersion instance, not a plain str. Embedding
+        # the object makes any checkpoint carrying this block unloadable under the
+        # torch>=2.6 default of weights_only=True. See `.claude/common-pitfalls.md`.
+        torch_version = str(torch.__version__)
         cuda_version = torch.version.cuda
         device_name = (
             torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
