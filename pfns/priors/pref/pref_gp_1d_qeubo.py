@@ -74,14 +74,14 @@ def get_batch(
     jitter=1e-6,
     **kwargs,
 ):
-    assert num_features == 2, "pref_gp_1d only supports num_features=2"
+    assert num_features >= 2 and num_features % 2 == 0
     assert single_eval_pos is not None
     assert 0 <= single_eval_pos <= seq_len
 
     gp_dim = num_features // 2
 
     # Need 2 * seq_len original GP inputs, since each token is a pair
-    X = torch.rand(batch_size, 2 * seq_len, gp_dim, device=device)
+    X = torch.rand(batch_size, 2 * seq_len, gp_dim, device=device) # TODO: add pool size instead of seq_len part, compare to points from final population
 
     Fs, Ys = sample_gp_batch(
         X,
@@ -135,6 +135,8 @@ def get_batch(
         target_y=qeubo,
         single_eval_pos=single_eval_pos,
     )
+# g(x, x')
+# classification whether the 1st element is better or not
 
 
 @dataclass(frozen=True)

@@ -7,7 +7,7 @@ import torch
 from pfns.priors import Batch
 from pfns.priors.prior import PriorConfig
 
-torch.set_default_dtype(torch.double)
+torch.set_default_dtype(torch.float32)
 
 
 def make_gp_prior(
@@ -17,6 +17,7 @@ def make_gp_prior(
     mean_constant=0.0,
     jitter=1e-6,
 ):
+    """Builds an RBF GP prior with fixed hyperparameters."""
     mean_module = gpytorch.means.ConstantMean()
     mean_module.initialize(constant=mean_constant)
 
@@ -40,6 +41,7 @@ def sample_gp_batch(
     noise_std=None,
     jitter=1e-6,
 ):
+    """Samples latent GP utilities and noisy observed utilities."""
     with torch.no_grad():
         f_dist = make_gp_prior(
             X,
@@ -48,7 +50,6 @@ def sample_gp_batch(
             mean_constant=mean_constant,
             jitter=jitter,
         )
-
         f = f_dist.rsample()
 
         if noise_std is None:
@@ -62,7 +63,7 @@ def sample_gp_batch(
 def get_batch(
     batch_size=2,
     seq_len=100,
-    num_features=1,
+    num_features=2,
     hyperparameters=None,
     device="cpu",
     single_eval_pos=None,
@@ -74,17 +75,20 @@ def get_batch(
     jitter=1e-6,
     **kwargs,
 ):
-    assert num_features == 2, "pref_gp_1d only supports num_features=2"
+    """
+    Samples preference-context tasks with point-utility queries.
+
+    Context tokens are pairwise comparisons encoded as [winner_x, loser_x].
+    Query tokens contain one point encoded as [x, 0], and the target is f(x).
+    """
+    assert num_features % 2 == 0, "Features must store context pairs as [x1, x2]."
     assert single_eval_pos is not None
     assert 0 <= single_eval_pos <= seq_len
 
     gp_dim = num_features // 2
 
-    # Need:
-    # - 2 * single_eval_pos points for pairwise-comparison context
-    # - (seq_len - single_eval_pos) points for queries
-    # Total = seq_len + single_eval_pos
-    X = torch.rand(batch_size, single_eval_pos + seq_len, gp_dim, device=device)
+    # We need two GP points per context comparison and one GP point per query.
+    X = torch.rand(batch_size, seq_len + single_eval_pos, gp_dim, device=device)
 
     Fs, Ys = sample_gp_batch(
         X,
@@ -95,61 +99,51 @@ def get_batch(
         jitter=jitter,
     )
 
-    # X:  (B, seq_len + single_eval_pos, 1)
-    # Fs: (B, seq_len + single_eval_pos)
-    # Ys: (B, seq_len + single_eval_pos)
-
+    # Token dimension stays 2 * gp_dim for both context pairs and point queries.
     new_X = torch.zeros(batch_size, seq_len, num_features, device=device, dtype=X.dtype)
-    new_Fs = torch.zeros(batch_size, seq_len, device=device, dtype=Fs.dtype)
-    new_Ys = torch.zeros(batch_size, seq_len, device=device, dtype=Ys.dtype)
+    observed_utility = torch.zeros(batch_size, seq_len, device=device, dtype=Ys.dtype)
+    latent_utility = torch.zeros(batch_size, seq_len, device=device, dtype=Fs.dtype)
 
-    # First single_eval_pos tokens: pairwise comparison context
-    # pair t uses original indices (2t, 2t+1)
+    # First tokens are preference comparisons: best point first, worst point second.
     for t in range(single_eval_pos):
         i0 = 2 * t
         i1 = 2 * t + 1
 
-        x0 = X[:, i0, :]   # (B, 1)
-        x1 = X[:, i1, :]   # (B, 1)
-        y0 = Ys[:, i0]     # (B,)
-        y1 = Ys[:, i1]     # (B,)
+        x0 = X[:, i0, :]
+        x1 = X[:, i1, :]
+        y0 = Ys[:, i0]
+        y1 = Ys[:, i1]
 
-        prefer_x0 = (y0 > y1).unsqueeze(-1)  # (B, 1)
+        prefer_x0 = (y0 > y1).unsqueeze(-1)
+        best_x = torch.where(prefer_x0, x0, x1)
+        worst_x = torch.where(prefer_x0, x1, x0)
 
-        best_x = torch.where(prefer_x0, x0, x1)   # (B, 1)
-        worst_x = torch.where(prefer_x0, x1, x0)  # (B, 1)
+        new_X[:, t, :] = torch.cat([best_x, worst_x], dim=-1)
 
-        new_X[:, t, :] = torch.cat([best_x, worst_x], dim=-1) # (B, 2)
-    
-    # new_X.shape = (B, single_eval_pos, 2) best is always the first
-    # X_train = pairs
-    # y_train = 0
-
-    # Remaining tokens: utility queries [x, 0]
+    # Remaining tokens are point queries: [x, 0] with target f(x).
     num_queries = seq_len - single_eval_pos
     if num_queries > 0:
         src_start = 2 * single_eval_pos
         src_end = src_start + num_queries
 
-        query_X = X[:, src_start:src_end, :]   # (B, num_queries, 1)
-        query_Fs = Fs[:, src_start:src_end]    # (B, num_queries)
-        query_Ys = Ys[:, src_start:src_end]    # (B, num_queries)
+        query_X = X[:, src_start:src_end, :]
+        query_Fs = Fs[:, src_start:src_end]
+        query_Ys = Ys[:, src_start:src_end]
 
-        new_X[:, single_eval_pos:, :gp_dim] = query_X # (B, seq_len, 1), one column is always zero for queries
-        # second half remains zero-padded
-        new_Fs[:, single_eval_pos:] = query_Fs
-        new_Ys[:, single_eval_pos:] = query_Ys
+        new_X[:, single_eval_pos:, :gp_dim] = query_X
+        observed_utility[:, single_eval_pos:] = query_Ys
+        latent_utility[:, single_eval_pos:] = query_Fs
 
-    # As requested: zero out targets on context positions
     return Batch(
         x=new_X,
-        y=new_Ys,
-        target_y=new_Fs,
+        y=observed_utility,
+        target_y=latent_utility,
         single_eval_pos=single_eval_pos,
     )
 
+
 @dataclass(frozen=True)
-class PrefGP1DPriorConfig(PriorConfig):
+class PrefGPPointUtilityPriorConfig(PriorConfig):
     lengthscale: float = 0.2
     outputscale: float = 1.0
     mean_constant: float = 0.0
