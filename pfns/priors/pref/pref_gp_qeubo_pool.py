@@ -306,6 +306,7 @@ def get_batch(
     elo_k=1.0,
     n_random_diag_queries=0,
     exclude_seen_pairs=False,
+    target="value",
     jitter=1e-6,
     **kwargs,
 ):
@@ -500,7 +501,23 @@ def get_batch(
         f1 = Fs[batch_idx[:, None], idx1_q]      # (B, n_query)
 
         new_X[:, n_ctx:, :] = torch.cat([x0, x1], dim=-1)
-        qeubo[:, n_ctx:] = torch.maximum(f0, f1)
+        # `target`: "value" regresses max(f0,f1); "pool_regret" regresses max(f0,f1) - max_pool f.
+        #
+        # Why pool_regret [owner, 2026-08-16]. Under a KNOWN task the regret of any pair containing
+        # the pool optimum is exactly 0, so the target looks flat -- but the model predicts under
+        # the POSTERIOR, where the optimum is itself uncertain, and there
+        #     P(regret ~ 0 | context, pair) = P(this pair contains the optimum).
+        # That is exactly qEUBO's exploration term, re-expressed as probability mass near zero
+        # instead of as a shift in the mean. Measured on the exact posterior at d=6, that mass
+        # varies across incumbent-containing pairs by ~0.004 on a mean of 0.16-0.20 (real, not
+        # sampler noise: two-chain correlation 0.75-0.82 at 24k draws), while the corresponding
+        # difference in the MEAN is 0.016 -- a third of one bin on the uniform head the elo cells
+        # use. The regret configs' log-spaced borders resolve 0.0001-0.002 near zero, which is
+        # where that mass sits, so this parameterisation must be paired with such a head.
+        if target == "pool_regret":
+            qeubo[:, n_ctx:] = torch.maximum(f0, f1) - Fs.max(dim=1, keepdim=True).values
+        else:
+            qeubo[:, n_ctx:] = torch.maximum(f0, f1)
 
     return Batch(
         x=new_X,
@@ -549,6 +566,12 @@ class PrefGPqEUBOPoolPriorConfig(PriorConfig):
     # those configs pin it explicitly. See `.claude/design-decisions.md`.
     exclude_seen_pairs: bool = False
 
+    # "value" = max(f0,f1), what every checkpoint before 2026-08-16 was trained on.
+    # "pool_regret" = max(f0,f1) - max_pool f. MUST be paired with a bar head whose borders are
+    # dense near zero (see the 1-D regret configs' log-spaced borders); on a uniform head the
+    # near-optimal region collapses into one bin.
+    target: str = "value"
+
     def create_get_batch_method(self):
         return partial(
             get_batch,
@@ -562,6 +585,7 @@ class PrefGPqEUBOPoolPriorConfig(PriorConfig):
             incumbent_prob=self.incumbent_prob,
             query_policy=self.query_policy,
             exclude_seen_pairs=self.exclude_seen_pairs,
+            target=self.target,
             elo_k=self.elo_k,
             n_random_diag_queries=self.n_random_diag_queries,
             jitter=self.jitter,
