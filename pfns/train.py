@@ -732,7 +732,8 @@ def _flatten_config(obj, prefix=""):
     return out
 
 
-def assert_resume_config_matches(checkpoint, config, path, allow_mismatch=False):
+def assert_resume_config_matches(checkpoint, config, path, allow_mismatch=False,
+                                 action="RESUME", consequence=None):
     """Refuse to resume a checkpoint that was written by a DIFFERENT configuration.
 
     WHY THIS EXISTS [owner's request, 2026-08-18]. Resuming is silent and looks like success. On
@@ -769,13 +770,15 @@ def assert_resume_config_matches(checkpoint, config, path, allow_mismatch=False)
     lines = "\n".join(f"    {k}:\n      checkpoint: {a.get(k)}\n      current:    {b.get(k)}"
                        for k in diffs[:12])
     more = f"\n    ... and {len(diffs) - 12} more" if len(diffs) > 12 else ""
-    msg = (f"REFUSING TO RESUME: {path}\n"
+    if consequence is None:
+        consequence = (
+            "  A resume continues training the checkpoint's model, so a config mismatch means you are\n"
+            "  training something other than what this config describes -- and will overwrite the\n"
+            "  checkpoint with it. If this is a fresh run, remove train_state_dict_load_path. If the\n"
+            "  change is deliberate, set allow_config_mismatch=True.")
+    msg = (f"REFUSING TO {action}: {path}\n"
            f"  was written by a DIFFERENT configuration ({len(diffs)} field(s) differ):\n"
-           f"{lines}{more}\n"
-           f"  A resume continues training the checkpoint's model, so a config mismatch means you are\n"
-           f"  training something other than what this config describes -- and will overwrite the\n"
-           f"  checkpoint with it. If this is a fresh run, remove train_state_dict_load_path. If the\n"
-           f"  change is deliberate, set allow_config_mismatch=True.")
+           f"{lines}{more}\n" + consequence)
     if allow_mismatch:
         print("WARNING (allow_config_mismatch=True):\n" + msg)
         return
@@ -827,6 +830,34 @@ def load_config(train_state_dict_load_path, load_function: tp.Callable | None = 
     return MainConfig.from_dict(checkpoint["config"])
 
 
+def _assert_safe_to_overwrite(path, config, allow_mismatch=False, load_function=None):
+    """Refuse to overwrite a checkpoint belonging to a DIFFERENT experiment.
+
+    Complements `assert_resume_config_matches`, which only fires when a run RESUMES. A config whose
+    save path points at another experiment's checkpoint but which starts from scratch never loads it,
+    so the resume guard never runs and the file is destroyed at the first periodic save. That is the
+    worse of the two failures: a resume at least preserves the weights it continues from.
+
+    Overwriting a checkpoint written by the SAME config is normal -- that is what periodic saving and
+    re-running a config are. Only a mismatch is refused.
+    """
+    if load_function is None:
+        load_function = torch.load
+    if not os.path.exists(path):
+        return
+    try:
+        existing = load_function(path, map_location="cpu")
+    except Exception as e:
+        print(f"WARNING: could not read existing checkpoint at {path} to verify overwrite ({e}).")
+        return
+    assert_resume_config_matches(
+        existing, config, path, allow_mismatch=allow_mismatch, action="OVERWRITE",
+        consequence=(
+            "  This run is about to REPLACE a checkpoint produced by a different configuration, and\n"
+            "  it never loaded it, so nothing else would have noticed. Point train_state_dict_save_path\n"
+            "  at this run's own file. If the replacement is deliberate, set allow_config_mismatch=True."))
+
+
 def save_checkpoint(
     model,
     optimizer,
@@ -841,6 +872,22 @@ def save_checkpoint(
         if isinstance(model, torch.nn.parallel.DistributedDataParallel)
         else model
     )
+    # SAVE-SIDE GUARD, the complement of assert_resume_config_matches [owner, 2026-08-18].
+    #
+    # The load-side guard cannot see the most destructive case. A config whose SAVE path points at
+    # another experiment's checkpoint while starting from scratch never loads it, so nothing compares
+    # anything -- the file is simply overwritten at the first periodic save, and the original is gone.
+    # Verified: should_load_checkpoint() returns False for exactly that configuration.
+    #
+    # Checked once, before the first write of a run, rather than on every save.
+    if not getattr(save_checkpoint, "_verified", set()) or \
+            train_state_dict_save_path not in save_checkpoint._verified:
+        _assert_safe_to_overwrite(
+            train_state_dict_save_path, config,
+            allow_mismatch=getattr(config, "allow_config_mismatch", False))
+        if not hasattr(save_checkpoint, "_verified"):
+            save_checkpoint._verified = set()
+        save_checkpoint._verified.add(train_state_dict_save_path)
     print(f"Saving checkpoint to {train_state_dict_save_path} (epoch {epoch})")
     try:
         # Save model state dict, optimizer state dict, and current epoch
