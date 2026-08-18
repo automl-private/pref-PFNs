@@ -52,6 +52,11 @@ class MainConfig(base_config.BaseConfig):
     # Checkpointing
     train_state_dict_save_path: tp.Optional[str] = None
     train_state_dict_load_path: tp.Optional[str] = None
+    # Resuming continues training the CHECKPOINT's model, so a config mismatch means training
+    # something other than what this config describes -- and overwriting the checkpoint with it.
+    # `assert_resume_config_matches` refuses in that case; set this True to override deliberately,
+    # which keeps the escape hatch visible in the config and therefore in the provenance record.
+    allow_config_mismatch: bool = False
 
     # Validation
     test_priors: tp.List[prior.PriorConfig] | None = None
@@ -216,6 +221,8 @@ def train(
             c.train_state_dict_load_path,
             device,
             load_function=load_object_function,
+            config=c,
+            allow_config_mismatch=getattr(c, "allow_config_mismatch", False),
         )
     else:
         print(
@@ -690,6 +697,91 @@ def should_load_checkpoint(
     )
 
 
+# Fields that may legitimately differ between the config that WROTE a checkpoint and the config
+# resuming it. Everything else must match, or the resume is silently training a different model.
+#   epochs                      - extending a run is the main legitimate reason to resume;
+#   train_state_dict_*_path     - a resume may read one file and write another;
+#   tensorboard_path            - logging destination is not part of the experiment;
+#   device / num_workers        - execution environment, not the model or the data.
+RESUME_ALLOWED_DIFFS = frozenset({
+    "epochs", "train_state_dict_load_path", "train_state_dict_save_path",
+    "tensorboard_path", "device", "num_workers", "progress_bar", "verbose",
+})
+
+
+def _flatten_config(obj, prefix=""):
+    """Config -> {dotted key: repr}, so two configs can be diffed field by field."""
+    out = {}
+    d = obj if isinstance(obj, dict) else getattr(obj, "__dict__", None)
+    if d is None:
+        return {prefix.rstrip("."): repr(obj)}
+    for k, v in d.items():
+        key = f"{prefix}{k}"
+        if isinstance(v, (dict,)) or hasattr(v, "__dict__"):
+            out.update(_flatten_config(v, key + "."))
+        elif isinstance(v, (list, tuple)):
+            # Recurse into lists of config objects (e.g. `priors`). A stored config holds them as
+            # dicts and a live one as objects, so comparing reprs would always differ.
+            for i, item in enumerate(v):
+                if isinstance(item, dict) or hasattr(item, "__dict__"):
+                    out.update(_flatten_config(item, f"{key}[{i}]."))
+                else:
+                    out[f"{key}[{i}]"] = repr(item)
+        else:
+            out[key] = repr(v)
+    return out
+
+
+def assert_resume_config_matches(checkpoint, config, path, allow_mismatch=False):
+    """Refuse to resume a checkpoint that was written by a DIFFERENT configuration.
+
+    WHY THIS EXISTS [owner's request, 2026-08-18]. Resuming is silent and looks like success. On
+    2026-08-18 three training jobs for new seed replicates were generated from another cell's config
+    by substitution; the hardcoded `train_state_dict_load_path` came along unchanged, so all three
+    loaded that cell's checkpoint, found it already at its final epoch, trained nothing, and re-saved
+    it. Elapsed 13 seconds, exit code 0, `Final loss: inf` -- a job that reports success while doing
+    the opposite of what was intended, and which would have overwritten a checkpoint other results
+    depend on had the epoch differed.
+
+    A resume is only meaningful if the checkpoint was produced by the same experiment. Comparing the
+    stored config against the current one makes that explicit rather than assumed. Fields that
+    legitimately change on a resume are listed in RESUME_ALLOWED_DIFFS.
+
+    Set `allow_config_mismatch=True` in the config to override deliberately -- e.g. resuming after an
+    intentional change -- which keeps the escape hatch but makes it appear in the config, and so in
+    the provenance record, rather than being invisible.
+    """
+    stored = checkpoint.get("config") if isinstance(checkpoint, dict) else None
+    if stored is None:
+        print("WARNING: checkpoint carries no config; cannot verify it matches. Proceeding.")
+        return
+    a, b = _flatten_config(stored), _flatten_config(config)
+    # Compare only keys present in BOTH, and ignore serialisation bookkeeping. A stored config is a
+    # dict carrying `__config_type__` markers the live object lacks, and a field added to MainConfig
+    # after a checkpoint was written is absent from it -- neither is an experiment difference, and
+    # treating them as one would make the guard fire on every pre-existing checkpoint.
+    keys = {k for k in set(a) & set(b)
+            if not k.endswith("__config_type__")
+            and k.split(".")[-1] not in RESUME_ALLOWED_DIFFS}
+    diffs = sorted(k for k in keys if a[k] != b[k])
+    if not diffs:
+        return
+    lines = "\n".join(f"    {k}:\n      checkpoint: {a.get(k)}\n      current:    {b.get(k)}"
+                       for k in diffs[:12])
+    more = f"\n    ... and {len(diffs) - 12} more" if len(diffs) > 12 else ""
+    msg = (f"REFUSING TO RESUME: {path}\n"
+           f"  was written by a DIFFERENT configuration ({len(diffs)} field(s) differ):\n"
+           f"{lines}{more}\n"
+           f"  A resume continues training the checkpoint's model, so a config mismatch means you are\n"
+           f"  training something other than what this config describes -- and will overwrite the\n"
+           f"  checkpoint with it. If this is a fresh run, remove train_state_dict_load_path. If the\n"
+           f"  change is deliberate, set allow_config_mismatch=True.")
+    if allow_mismatch:
+        print("WARNING (allow_config_mismatch=True):\n" + msg)
+        return
+    raise ValueError(msg)
+
+
 def load_checkpoint(
     model,
     optimizer,
@@ -697,12 +789,17 @@ def load_checkpoint(
     train_state_dict_load_path,
     device,
     load_function: tp.Callable | None = None,
+    config=None,
+    allow_config_mismatch: bool = False,
 ):
     print(f"Loading checkpoint from {train_state_dict_load_path}")
     if load_function is None:
         load_function = torch.load
     try:
         checkpoint = load_function(train_state_dict_load_path, map_location=device)
+        if config is not None:
+            assert_resume_config_matches(
+                checkpoint, config, train_state_dict_load_path, allow_config_mismatch)
         if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
             # New format with model, optimizer state and epoch
             model.load_state_dict(checkpoint["model_state_dict"], strict=True)
