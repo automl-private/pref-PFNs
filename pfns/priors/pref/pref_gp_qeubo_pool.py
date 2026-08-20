@@ -140,7 +140,7 @@ def _incumbent_duel_context(Fs, Ys, B, K, n_ctx, device, *, noise_std,
 
 
 def _elo_softmax_context(Fs, Ys, B, K, n_ctx, device, *, noise_std, noise_per_comparison,
-                         elo_k, T_ctx, exclude_seen_pairs=False):
+                         elo_k, T_ctx, exclude_seen_pairs=False, hub_permute=False):
     """Elo-ranked softmax contexts: pairs are drawn by softmax over running Elo ratings.
 
     Ported from `scripts/prior_lab.py`, which is the specification; a parity test lives in
@@ -156,9 +156,26 @@ def _elo_softmax_context(Fs, Ys, B, K, n_ctx, device, *, noise_std, noise_per_co
     `T_ctx` is `(B,)` -- ONE temperature per task, drawn U(0,1) by the caller, so a batch spans
     concentrated and near-uniform comparison graphs rather than one regime.
 
+    `hub_permute` [added 2026-08-20] is the DEGREE-DECORRELATION ablation. Pairs are sampled by
+    softmax over `elo[perm]` for a fixed per-task random permutation, while outcomes and the
+    returned ratings still use the REAL elo. The score distribution -- and therefore the degree
+    distribution, the hub sizes and the chain structure -- is bit-for-bit the same shape as the
+    unpermuted sampler; only the IDENTITY of the hub changes, from the quality leader to a random
+    point. So it breaks rho(degree, f) while leaving rho(wins, f) and the topology intact.
+
+    Why that specific intervention: `star_vs_transitivity.txt` shows the model letting a star of 16
+    overturn a logically determined transitive ordering, and `star_size_in_prior.txt` shows why --
+    in this prior degree tracks quality at rho ~0.3 and the highest-degree point is the best point
+    20-35% of the time against ~2% chance, so reading degree is a rational shortcut. Simply
+    switching to a uniform context also decorrelates degree, but the existing `uu`/`eu` cells are
+    DEGENERATE and `ue` is a known-weak family, so that comparison is confounded by model quality.
+    This keeps everything else fixed.
+
     Returns `(win_idx, lose_idx, elo)`; the ratings are returned because the query sampler needs
     them, and recomputing them there would not match (the trajectory is stochastic).
     """
+    hub_perm = (torch.argsort(torch.rand((B, K), device=device), dim=1)
+                if hub_permute else None)
     elo = torch.zeros((B, K), device=device, dtype=Fs.dtype)
     win_all = torch.empty((B, n_ctx), dtype=torch.long, device=device)
     lose_all = torch.empty((B, n_ctx), dtype=torch.long, device=device)
@@ -185,7 +202,10 @@ def _elo_softmax_context(Fs, Ys, B, K, n_ctx, device, *, noise_std, noise_per_co
         # and would waste a slot in the graph. Sampling without replacement enforces this
         # structurally, which is also the owner's rule (self-pairs are rejected in the context and
         # kept in the queries).
-        probs = torch.softmax(elo / Tc, dim=1)                    # (B, K)
+        # `hub_permute`: sample by the elo of a DIFFERENT, randomly assigned point, so the
+        # degree distribution is unchanged but its correlation with quality is destroyed.
+        score = torch.gather(elo, 1, hub_perm) if hub_perm is not None else elo
+        probs = torch.softmax(score / Tc, dim=1)                  # (B, K)
         pair = torch.multinomial(probs, 2, replacement=False)     # (B, 2)
         i, j = pair[:, 0], pair[:, 1]
         if seen_pair is not None:
@@ -421,7 +441,7 @@ def get_batch(
             win_idx = torch.where(prefer_x0[..., 0], idx0_ctx, idx1_ctx)
             lose_idx = torch.where(prefer_x0[..., 0], idx1_ctx, idx0_ctx)
 
-        elif context_policy == "elo_softmax":
+        elif context_policy in ("elo_softmax", "elo_softmax_randhub"):
             # Like the incumbent duel, this generator must resolve each comparison itself: the
             # next pair depends on the ratings, which depend on who won.
             win_idx, lose_idx, elo_ratings = _elo_softmax_context(
@@ -430,6 +450,7 @@ def get_batch(
                 noise_per_comparison=noise_per_comparison,
                 elo_k=elo_k, T_ctx=T_ctx,
                 exclude_seen_pairs=exclude_seen_pairs,
+                hub_permute=(context_policy == "elo_softmax_randhub"),
             )
 
         elif context_policy == "incumbent":
@@ -445,7 +466,7 @@ def get_batch(
             )
         else:
             raise ValueError(f"unknown context_policy {context_policy!r}; "
-                             f"expected 'uniform', 'incumbent' or 'elo_softmax'")
+                             f"expected 'uniform', 'incumbent', 'elo_softmax' or 'elo_softmax_randhub'")
 
         new_X[:, :n_ctx, :] = torch.cat(
             [pool_X[batch_idx[:, None], win_idx],
