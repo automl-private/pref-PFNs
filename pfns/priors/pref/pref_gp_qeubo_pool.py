@@ -322,6 +322,8 @@ def get_batch(
     noise_per_comparison=True,
     context_policy="uniform",
     incumbent_prob=1.0,
+    T_ctx_low=0.0,
+    T_ctx_high=1.0,
     query_policy="uniform",
     elo_k=1.0,
     n_random_diag_queries=0,
@@ -406,9 +408,21 @@ def get_batch(
     # sample context pairs without replacement within pair
     # ------------------------------------------------------------
     n_ctx = single_eval_pos
-    # ONE temperature per task, U(0,1). Drawn even when unused so the RNG stream does not depend
-    # on the policy, which keeps a uniform-context control comparable seed-for-seed.
+    # ONE temperature per task, U(T_ctx_low, T_ctx_high). Drawn even when unused so the RNG stream
+    # does not depend on the policy, which keeps a uniform-context control comparable seed-for-seed.
+    #
+    # The RANGE is a config field as of 2026-08-23 [owner asked for a local search over prior
+    # space]. It was hardcoded U(0,1), and the defaults below reproduce that BIT-FOR-BIT: the
+    # `torch.rand` call is unchanged and the affine map is the identity when (low, high) = (0, 1),
+    # so every existing checkpoint's distribution is untouched.
+    #
+    # Why this knob specifically: `readouts/n6/prior_temperature_support.txt` shows the oracle's
+    # context statistics are matched at T ~ 0.05-0.15 and that ~90% of U(0,1) mass sits above that,
+    # sampling contexts no policy would ever produce. Narrowing the range is the cheapest available
+    # move toward the deployment distribution and does not change the prior's family.
     T_ctx = torch.rand(B, device=device, dtype=Fs.dtype)
+    if (T_ctx_low, T_ctx_high) != (0.0, 1.0):
+        T_ctx = T_ctx_low + (T_ctx_high - T_ctx_low) * T_ctx
     elo_ratings = None
     if n_ctx > 0:
         if context_policy == "uniform":
@@ -572,6 +586,13 @@ class PrefGPqEUBOPoolPriorConfig(PriorConfig):
     context_policy: str = "uniform"
     incumbent_prob: float = 1.0
 
+    # Range of the per-task context temperature, U(low, high). (0.0, 1.0) is the historical
+    # hardcoded behaviour and is reproduced exactly. Low temperature concentrates the softmax on
+    # the Elo leader and produces oracle-like, star-shaped graphs; high temperature is near-uniform
+    # random pairing. See `readouts/n6/prior_temperature_support.txt`.
+    T_ctx_low: float = 0.0
+    T_ctx_high: float = 1.0
+
     # Elo-softmax sampling. `context_policy="elo_softmax"` and `query_policy="elo_softmax"` are
     # INDEPENDENT switches so the 2x2 ablation (context x query) is a config change, not a code
     # change. Elo ratings are always accumulated over whatever context was generated, so
@@ -603,6 +624,8 @@ class PrefGPqEUBOPoolPriorConfig(PriorConfig):
             noise_std=self.noise_std,
             noise_per_comparison=self.noise_per_comparison,
             context_policy=self.context_policy,
+            T_ctx_low=self.T_ctx_low,
+            T_ctx_high=self.T_ctx_high,
             incumbent_prob=self.incumbent_prob,
             query_policy=self.query_policy,
             exclude_seen_pairs=self.exclude_seen_pairs,
