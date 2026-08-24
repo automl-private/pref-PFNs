@@ -73,6 +73,7 @@ class TableTransformer(nn.Module):
         rope_multiplier: float = 1,
         positions_num_measures: int = 0,
         x_only_mode: bool = False,
+        num_register_tokens: int = 0,
         **layer_kwargs: Any,
     ):
         """Initializes the PerFeatureTransformer module.
@@ -232,6 +233,24 @@ class TableTransformer(nn.Module):
             ), "features_per_group must be 1 when x_only_mode is True"
 
         self.x_only_mode = x_only_mode
+
+        # REGISTER / ATTENTION-SINK TOKENS. [owner, 2026-08-25: "can you try whether adding an
+        # attention sink / register token helps. Without, it may be difficult for the transformer
+        # to ignore its context for unseen points."]
+        #
+        # Softmax attention must place its mass somewhere: the weights over the context sum to 1
+        # whether or not any context token is relevant. For a pool point the context says nothing
+        # about -- and at ls=0.2 in d=6 that is ~98% of the pool -- there is no way to attend to
+        # nothing, so the model is forced to read context that carries no information about it.
+        # A learned register token prepended to the CONTEXT gives that mass somewhere to go.
+        #
+        # Prepended before the context and counted into single_eval_pos, so every query position
+        # can attend to it, mirroring how the style token is handled below.
+        self.num_register_tokens = num_register_tokens
+        if num_register_tokens > 0:
+            self.register_tokens = nn.Parameter(
+                torch.randn(num_register_tokens, ninp) * 0.02
+            )
 
     def forward(
         self,
@@ -643,6 +662,18 @@ class TableTransformer(nn.Module):
             )  # batch emsize -> batch 1 1 emsize
         else:
             embedded_y_style = None
+
+        if self.num_register_tokens > 0:
+            # (r, e) -> (b, r, groups, e); the same embedding in every group slot, so this does
+            # not depend on the feature count.
+            reg = self.register_tokens[None, :, None, :].expand(
+                embedded_input.shape[0],
+                self.num_register_tokens,
+                embedded_input.shape[2],
+                embedded_input.shape[3],
+            )
+            embedded_input = torch.cat((reg, embedded_input), dim=1)
+            current_context_len += self.num_register_tokens
 
         if embedded_style is not None or embedded_y_style is not None:
             if embedded_style is None:
